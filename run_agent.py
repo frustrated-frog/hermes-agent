@@ -1,239 +1,365 @@
 #!/usr/bin/env python3
 """
-AI Agent Runner with Tool Calling
+AI Agent Runner with Tool Calling - Hermes 核心智能体执行器
 
-This module provides a clean, standalone agent that can execute AI models
-with tool calling capabilities. It handles the conversation loop, tool execution,
-and response management.
+这是 Hermes 的核心模块，提供了一个完整的 AI 智能体运行环境，专门用于执行带有工具调用能力的 AI 模型。
+该模块负责整个对话循环、工具执行和响应管理的完整生命周期。
 
-Features:
-- Automatic tool calling loop until completion
-- Configurable model parameters
-- Error handling and recovery
-- Message history management
-- Support for multiple model providers
+核心架构原理：
+- 基于 OpenAI API 兼容的客户端架构，支持多种模型提供商
+- 实现了完整的工具调用循环：解析工具调用 → 执行工具 → 返回结果 → 继续对话
+- 内置了复杂的并发控制和错误恢复机制
+- 支持多轮对话历史管理和上下文压缩
+- 集成了完整的系统提示词构建和模型元数据管理
 
-Usage:
+关键特性：
+- 自动工具调用循环直到任务完成：智能体可以连续调用多个工具来完成复杂任务
+- 可配置的模型参数：支持温度、最大令牌数、上下文窗口等参数的动态调整
+- 完整的错误处理和恢复机制：包含网络重试、模型降级、上下文溢出处理等
+- 消息历史管理：智能维护对话历史，支持上下文压缩和记忆管理
+- 多模型提供商支持：通过统一的 OpenAI 兼容接口支持 Claude、GPT 等多种模型
+
+使用示例：
     from run_agent import AIAgent
     
+    # 创建智能体实例，配置模型端点和具体模型
     agent = AIAgent(base_url="http://localhost:30000/v1", model="claude-opus-4-20250514")
+    
+    # 运行对话，智能体会自动处理工具调用和响应
     response = agent.run_conversation("Tell me about the latest Python updates")
 """
 
-import atexit
-import asyncio
-import base64
-import concurrent.futures
-import copy
-import hashlib
-import json
-import logging
-logger = logging.getLogger(__name__)
-import os
-import random
-import re
-import sys
-import tempfile
-import time
-import threading
-import weakref
-from types import SimpleNamespace
-import uuid
-from typing import List, Dict, Any, Optional
-from openai import OpenAI
-import fire
-from datetime import datetime
-from pathlib import Path
+# 系统级和标准库导入 - 为智能体运行提供基础功能支持
+import atexit  # 注册程序退出时的清理函数
+import asyncio  # 异步编程支持，用于并发工具执行
+import base64  # Base64 编码解码，用于处理二进制数据
+import concurrent.futures  # 线程池和进程池，用于并行工具执行
+import copy  # 深拷贝支持，用于创建对象的安全副本
+import hashlib  # 哈希算法，用于生成唯一标识符和缓存键
+import json  # JSON 序列化/反序列化，用于 API 通信和数据存储
+import logging  # 日志系统，用于记录运行状态和调试信息
+logger = logging.getLogger(__name__)  # 获取当前模块的日志记录器实例
+import os  # 操作系统接口，用于环境变量和文件系统操作
+import random  # 随机数生成，用于加载动画和随机选择
+import re  # 正则表达式，用于文本模式匹配和验证
+import sys  # 系统特定参数和函数，用于标准输入输出控制
+import tempfile  # 临时文件和目录处理，用于安全文件操作
+import time  # 时间相关函数，用于性能计时和延迟
+import threading  # 线程支持，用于并发控制和线程安全
+import weakref  # 弱引用，用于内存管理和避免循环引用
+from types import SimpleNamespace  # 简单的属性容器，用于创建轻量级对象
+import uuid  # 通用唯一标识符生成，用于会话和请求跟踪
+from typing import List, Dict, Any, Optional  # 类型注解，提供代码静态类型检查
+from openai import OpenAI  # OpenAI 客户端库，提供与 OpenAI API 兼容的接口
+import fire  # 命令行接口生成库，用于创建 CLI 工具
+from datetime import datetime  # 日期时间处理，用于时间戳和日志记录
+from pathlib import Path  # 面向对象的路径操作，提供跨平台的文件路径处理
 
-from hermes_constants import get_hermes_home
+# Hermes 框架核心导入 - 提供框架级别的功能支持
+from hermes_constants import get_hermes_home  # 获取 Hermes 主目录路径的常量函数
 
-# Load .env from ~/.hermes/.env first, then project root as dev fallback.
-# User-managed env files should override stale shell exports on restart.
-from hermes_cli.env_loader import load_hermes_dotenv
+# 环境变量加载机制 - 确保用户配置优先于系统默认
+# 加载顺序：~/.hermes/.env 优先，项目根目录的 .env 作为开发环境后备
+# 这种设计确保用户管理的 env 文件可以覆盖过时的 shell 环境变量
+from hermes_cli.env_loader import load_hermes_dotenv  # Hermes 专用的环境变量加载器
 
-_hermes_home = get_hermes_home()
-_project_env = Path(__file__).parent / '.env'
-_loaded_env_paths = load_hermes_dotenv(hermes_home=_hermes_home, project_env=_project_env)
-if _loaded_env_paths:
-    for _env_path in _loaded_env_paths:
-        logger.info("Loaded environment variables from %s", _env_path)
-else:
-    logger.info("No .env file found. Using system environment variables.")
+# 环境变量加载执行 - 构建完整的配置环境
+_hermes_home = get_hermes_home()  # 获取 Hermes 主目录路径，通常是 ~/.hermes
+_project_env = Path(__file__).parent / '.env'  # 项目根目录下的 .env 文件路径，用于开发环境
+_loaded_env_paths = load_hermes_dotenv(hermes_home=_hermes_home, project_env=_project_env)  # 执行环境变量加载
+
+# 环境加载结果处理 - 提供清晰的配置反馈
+if _loaded_env_paths:  # 如果成功加载了环境变量文件
+    for _env_path in _loaded_env_paths:  # 遍历所有加载的文件路径
+        logger.info("Loaded environment variables from %s", _env_path)  # 记录加载信息，便于调试
+else:  # 如果没有找到环境变量文件
+    logger.info("No .env file found. Using system environment variables.")  # 使用系统环境变量
 
 
-# Import our tool system
+# 工具系统导入 - 构建智能体的工具执行能力
+# 这些模块提供了智能体与外部环境交互的核心功能
 from model_tools import (
-    get_tool_definitions,
-    get_toolset_for_tool,
-    handle_function_call,
-    check_toolset_requirements,
+    get_tool_definitions,  # 获取所有可用工具的定义信息
+    get_toolset_for_tool,  # 根据工具名称获取对应的工具集
+    handle_function_call,  # 处理函数调用的核心逻辑
+    check_toolset_requirements,  # 检查工具集的运行时要求
 )
-from tools.terminal_tool import cleanup_vm
-from tools.interrupt import set_interrupt as _set_interrupt
-from tools.browser_tool import cleanup_browser
+from tools.terminal_tool import cleanup_vm  # 虚拟机清理函数，确保环境安全
+from tools.interrupt import set_interrupt as _set_interrupt  # 中断处理机制
+from tools.browser_tool import cleanup_browser  # 浏览器资源清理函数
 
 
-from hermes_constants import OPENROUTER_BASE_URL
+# 核心配置常量导入
+from hermes_constants import OPENROUTER_BASE_URL  # OpenRouter API 的基础 URL
 
-# Agent internals extracted to agent/ package for modularity
-from agent.memory_manager import build_memory_context_block
+# 智能体内部模块导入 - 核心功能模块化设计
+# 这些模块将智能体的复杂功能分解为独立的、可维护的组件
+from agent.memory_manager import build_memory_context_block  # 构建记忆上下文块
 from agent.prompt_builder import (
-    DEFAULT_AGENT_IDENTITY, PLATFORM_HINTS,
-    MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE,
-    build_nous_subscription_prompt,
+    DEFAULT_AGENT_IDENTITY,  # 默认的智能体身份定义
+    PLATFORM_HINTS,  # 平台相关的提示信息
+    MEMORY_GUIDANCE,  # 记忆管理指导
+    SESSION_SEARCH_GUIDANCE,  # 会话搜索功能指导
+    SKILLS_GUIDANCE,  # 技能系统指导
+    build_nous_subscription_prompt,  # 构建 Nous 订阅相关的提示
 )
+# 模型元数据管理 - 提供模型相关的信息和优化
 from agent.model_metadata import (
-    fetch_model_metadata,
-    estimate_tokens_rough, estimate_messages_tokens_rough, estimate_request_tokens_rough,
-    get_next_probe_tier, parse_context_limit_from_error,
-    save_context_length, is_local_endpoint,
+    fetch_model_metadata,  # 获取模型元数据信息
+    estimate_tokens_rough,  # 粗略估计令牌数量
+    estimate_messages_tokens_rough,  # 估计消息令牌数量
+    estimate_request_tokens_rough,  # 估计请求令牌数量
+    get_next_probe_tier,  # 获取下一个探测层级
+    parse_context_limit_from_error,  # 从错误中解析上下文限制
+    save_context_length,  # 保存上下文长度信息
+    is_local_endpoint,  # 判断是否为本地端点
 )
-from agent.context_compressor import ContextCompressor
-from agent.subdirectory_hints import SubdirectoryHintTracker
-from agent.prompt_caching import apply_anthropic_cache_control
-from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, DEVELOPER_ROLE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
-from agent.usage_pricing import estimate_usage_cost, normalize_usage
+from agent.context_compressor import ContextCompressor  # 上下文压缩器，用于处理长上下文
+from agent.subdirectory_hints import SubdirectoryHintTracker  # 子目录提示跟踪器
+from agent.prompt_caching import apply_anthropic_cache_control  # Anthropic 缓存控制
+from agent.prompt_builder import (
+    build_skills_system_prompt,  # 构建技能系统提示
+    build_context_files_prompt,  # 构建上下文文件提示
+    load_soul_md,  # 加载 SOUL.md 文件
+    TOOL_USE_ENFORCEMENT_GUIDANCE,  # 工具使用强制指导
+    TOOL_USE_ENFORCEMENT_MODELS,  # 工具使用强制模型列表
+    DEVELOPER_ROLE_MODELS,  # 开发者角色模型列表
+    GOOGLE_MODEL_OPERATIONAL_GUIDANCE,  # Google 模型操作指导
+    OPENAI_MODEL_EXECUTION_GUIDANCE,  # OpenAI 模型执行指导
+)
+from agent.usage_pricing import estimate_usage_cost, normalize_usage  # 使用量计费和标准化
 from agent.display import (
-    KawaiiSpinner, build_tool_preview as _build_tool_preview,
-    get_cute_tool_message as _get_cute_tool_message_impl,
-    _detect_tool_failure,
-    get_tool_emoji as _get_tool_emoji,
+    KawaiiSpinner,  # 可爱的加载动画
+    build_tool_preview as _build_tool_preview,  # 构建工具预览
+    get_cute_tool_message as _get_cute_tool_message_impl,  # 获取可爱的工具消息
+    _detect_tool_failure,  # 检测工具失败
+    get_tool_emoji as _get_tool_emoji,  # 获取工具表情符号
 )
 from agent.trajectory import (
-    convert_scratchpad_to_think, has_incomplete_scratchpad,
-    save_trajectory as _save_trajectory_to_file,
+    convert_scratchpad_to_think,  # 将草稿转换为思考内容
+    has_incomplete_scratchpad,  # 检查是否有不完整的草稿
+    save_trajectory as _save_trajectory_to_file,  # 保存轨迹到文件
 )
-from utils import atomic_json_write, env_var_enabled
+from utils import atomic_json_write, env_var_enabled  # 原子 JSON 写入和环境变量检查
 
 
 
+# 安全输出包装器 - 防止管道错误导致智能体崩溃
 class _SafeWriter:
-    """Transparent stdio wrapper that catches OSError/ValueError from broken pipes.
-
-    When hermes-agent runs as a systemd service, Docker container, or headless
-    daemon, the stdout/stderr pipe can become unavailable (idle timeout, buffer
-    exhaustion, socket reset). Any print() call then raises
-    ``OSError: [Errno 5] Input/output error``, which can crash agent setup or
-    run_conversation() — especially via double-fault when an except handler
-    also tries to print.
-
-    Additionally, when subagents run in ThreadPoolExecutor threads, the shared
-    stdout handle can close between thread teardown and cleanup, raising
-    ``ValueError: I/O operation on closed file`` instead of OSError.
-
-    This wrapper delegates all writes to the underlying stream and silently
-    catches both OSError and ValueError. It is transparent when the wrapped
-    stream is healthy.
+    """
+    透明的标准输入输出包装器，用于捕获管道损坏导致的 OSError/ValueError。
+    
+    设计原理：
+    当 hermes-agent 作为 systemd 服务、Docker 容器或无头守护进程运行时，stdout/stderr
+    管道可能因为空闲超时、缓冲区耗尽或套接字重置而变得不可用。此时任何 print() 调用都会引发
+    OSError: [Errno 5] Input/output error，这可能导致智能体设置或 run_conversation() 崩溃，
+    特别是当异常处理程序也尝试打印时，会通过双重故障导致崩溃。
+    
+    另外，当子智能体在 ThreadPoolExecutor 线程中运行时，共享的 stdout 句柄可能在线程
+    拆解和清理之间关闭，引发 ValueError: I/O operation on closed file 而不是 OSError。
+    
+    这个包装器将所有写操作委托给底层流，并静默捕获 OSError 和 ValueError。当被包装的
+    流健康时，它是完全透明的，不会影响正常操作。
+    
+    这种设计的核心价值在于：确保智能体即使在恶劣的运行环境下也能保持稳定运行，
+    不会因为输出问题而意外终止，提供了强大的容错能力。
     """
 
+    # 使用 __slots__ 优化内存使用，限制实例属性
     __slots__ = ("_inner",)
 
     def __init__(self, inner):
+        # 使用 object.__setattr__ 避免递归调用，直接设置内部流对象
         object.__setattr__(self, "_inner", inner)
 
     def write(self, data):
+        """安全写操作 - 捕获所有可能的 I/O 错误"""
         try:
+            # 尝试将数据写入底层流
             return self._inner.write(data)
         except (OSError, ValueError):
+            # 如果发生错误，返回数据长度假装写入成功
+            # 这样调用者不会察觉到错误，保持接口一致性
             return len(data) if isinstance(data, str) else 0
 
     def flush(self):
+        """安全刷新操作 - 静默处理刷新错误"""
         try:
+            # 尝试刷新底层流
             self._inner.flush()
         except (OSError, ValueError):
+            # 静默捕获错误，不传播异常
             pass
 
     def fileno(self):
+        """获取文件描述符 - 直接委托给底层流"""
         return self._inner.fileno()
 
     def isatty(self):
+        """检查是否为终端 - 安全版本，捕获可能的错误"""
         try:
+            # 尝试检查是否为 TTY
             return self._inner.isatty()
         except (OSError, ValueError):
+            # 如果检查失败，假设不是 TTY
             return False
 
     def __getattr__(self, name):
+        """动态属性访问 - 将所有其他属性委托给底层流"""
         return getattr(self._inner, name)
 
 
 def _install_safe_stdio() -> None:
-    """Wrap stdout/stderr so best-effort console output cannot crash the agent."""
+    """安装安全的标准输入输出包装器。
+    
+    这个函数在智能体启动时被调用，用于包装 stdout 和 stderr 流。
+    它的核心作用是确保即使在最恶劣的运行环境下，智能体的输出操作也不会导致崩溃。
+    
+    设计考虑：
+    - 守护进程、容器化环境中管道可能随时断开
+    - 网络连接中断可能导致输出流不可用
+    - 多线程环境下共享流的竞争条件
+    
+    通过包装这些流，我们为智能体提供了一个稳定的输出层，这是构建可靠 AI 系统的基础。
+    """
+    # 遍历标准输出和标准错误流
     for stream_name in ("stdout", "stderr"):
-        stream = getattr(sys, stream_name, None)
+        stream = getattr(sys, stream_name, None)  # 获取流对象
         if stream is not None and not isinstance(stream, _SafeWriter):
+            # 只有当流存在且未被包装时才进行包装
             setattr(sys, stream_name, _SafeWriter(stream))
 
 
 class IterationBudget:
-    """Thread-safe iteration counter for an agent.
-
-    Each agent (parent or subagent) gets its own ``IterationBudget``.
-    The parent's budget is capped at ``max_iterations`` (default 90).
-    Each subagent gets an independent budget capped at
-    ``delegation.max_iterations`` (default 50) — this means total
-    iterations across parent + subagents can exceed the parent's cap.
-    Users control the per-subagent limit via ``delegation.max_iterations``
-    in config.yaml.
-
-    ``execute_code`` (programmatic tool calling) iterations are refunded via
-    :meth:`refund` so they don't eat into the budget.
+    """线程安全的迭代计数器 - 智能体的"燃料"管理系统。
+    
+    这个类实现了智能体执行的核心限制机制，防止智能体无限循环或过度消耗资源。
+    它是构建可靠 AI 系统的关键组件，确保智能体在合理的时间和资源范围内完成任务。
+    
+    设计原理：
+    - 每个智能体（父智能体或子智能体）都有自己的独立预算
+    - 父智能体的预算上限为 max_iterations（默认 90 次迭代）
+    - 每个子智能体有独立的预算上限为 delegation.max_iterations（默认 50 次迭代）
+    - 这意味着父智能体 + 所有子智能体的总迭代次数可以超过父智能体的上限
+    - 用户可以通过 config.yaml 中的 delegation.max_iterations 配置每个子智能体的限制
+    
+    特殊处理：
+    execute_code（编程式工具调用）的迭代会通过 refund() 方法返还，
+    这样编程任务不会消耗对话预算，确保技术任务可以充分执行而不影响对话质量。
+    
+    这种设计平衡了：
+    - 防止无限循环：确保智能体不会陷入死循环
+    - 资源控制：防止过度消耗 API 配额和计算资源
+    - 任务完整性：允许复杂的多步骤任务完成
+    - 子智能体独立性：每个委托的任务有自己的预算空间
     """
 
     def __init__(self, max_total: int):
-        self.max_total = max_total
-        self._used = 0
-        self._lock = threading.Lock()
+        """初始化迭代预算。
+        
+        Args:
+            max_total: 最大迭代次数，这是智能体可以执行的总步数限制
+        """
+        self.max_total = max_total  # 保存最大迭代次数
+        self._used = 0  # 已使用的迭代次数，初始为 0
+        self._lock = threading.Lock()  # 创建线程锁，确保多线程环境下的线程安全
 
     def consume(self) -> bool:
-        """Try to consume one iteration.  Returns True if allowed."""
-        with self._lock:
-            if self._used >= self.max_total:
-                return False
-            self._used += 1
-            return True
+        """尝试消耗一次迭代。
+        
+        这是预算管理的核心方法，每次智能体要执行一步操作时都会调用。
+        
+        Returns:
+            bool: 如果允许消耗（还有剩余预算）返回 True，否则返回 False
+            
+        线程安全考虑：
+        使用 with self._lock 确保在多线程环境下，预算的检查和更新是原子操作，
+        防止出现竞态条件导致预算超支。
+        """
+        with self._lock:  # 获取线程锁，确保操作的原子性
+            if self._used >= self.max_total:  # 检查是否已经用完所有预算
+                return False  # 预算已用完，不允许继续执行
+            self._used += 1  # 消耗一次迭代
+            return True  # 成功消耗，允许继续执行
 
     def refund(self) -> None:
-        """Give back one iteration (e.g. for execute_code turns)."""
-        with self._lock:
-            if self._used > 0:
-                self._used -= 1
+        """返还一次迭代（例如用于 execute_code 回合）。
+        
+        这个方法用于特殊情况的预算管理，主要应用于编程相关的工具调用。
+        原理是编程任务（如代码执行）通常是对话的一部分，但它们本身不应该
+        消耗对话预算，否则可能导致真正有意义的对话步骤被限制。
+        
+        使用场景：
+        - execute_code 工具调用后，返还消耗的迭代
+        - 某些内部工具调用不应该是用户可见的对话步骤
+        - 错误恢复时返还意外消耗的迭代
+        
+        这种设计确保了技术任务可以充分执行，同时保持对话质量。
+        """
+        with self._lock:  # 确保线程安全
+            if self._used > 0:  # 只有在确实消耗过的情况下才返还
+                self._used -= 1  # 返还一次迭代到预算池
 
     @property
     def used(self) -> int:
-        return self._used
+        """获取已使用的迭代次数。
+        
+        这是一个属性装饰器方法，允许像访问属性一样使用：budget.used
+        由于 self._used 是简单的整数读取，不需要锁保护。
+        """
+        return self._used  # 直接返回已使用的迭代次数
 
     @property
     def remaining(self) -> int:
-        with self._lock:
-            return max(0, self.max_total - self._used)
+        """获取剩余的迭代次数。
+        
+        计算并返回还可以执行多少次迭代。
+        由于涉及计算和可能的并发访问，需要线程锁保护。
+        """
+        with self._lock:  # 确保线程安全
+            return max(0, self.max_total - self._used)  # 确保不会返回负数
 
 
-# Tools that must never run concurrently (interactive / user-facing).
-# When any of these appear in a batch, we fall back to sequential execution.
-_NEVER_PARALLEL_TOOLS = frozenset({"clarify"})
+# 工具并发执行策略 - 智能体的并行计算控制中心
 
-# Read-only tools with no shared mutable session state.
+# 绝对禁止并发执行的工具集合 - 这些工具涉及用户交互或状态一致性
+# 当这些工具出现在批处理中时，系统会回退到顺序执行
+_NEVER_PARALLEL_TOOLS = frozenset({"clarify"})  # clarify 工具需要用户交互，必须串行化
+
+# 可以安全并行执行的只读工具 - 这些工具不修改共享状态
+# 它们没有可变的会话状态，因此可以安全地并发执行
 _PARALLEL_SAFE_TOOLS = frozenset({
-    "ha_get_state",
-    "ha_list_entities",
-    "ha_list_services",
-    "read_file",
-    "search_files",
-    "session_search",
-    "skill_view",
-    "skills_list",
-    "vision_analyze",
-    "web_extract",
-    "web_search",
+    "ha_get_state",      # Home Assistant 获取状态 - 只读操作
+    "ha_list_entities",  # Home Assistant 列出实体 - 只读操作
+    "ha_list_services",  # Home Assistant 列出服务 - 只读操作
+    "read_file",         # 文件读取 - 只读操作，无状态修改
+    "search_files",      # 文件搜索 - 只读操作，不影响现有文件
+    "session_search",    # 会话搜索 - 只读历史查询
+    "skill_view",        # 技能查看 - 只读技能内容获取
+    "skills_list",       # 技能列表 - 只读技能枚举
+    "vision_analyze",    # 视觉分析 - 独立的图像处理
+    "web_extract",       # 网页提取 - 只读网络数据获取
+    "web_search",        # 网络搜索 - 只读信息检索
 })
 
-# File tools can run concurrently when they target independent paths.
-_PATH_SCOPED_TOOLS = frozenset({"read_file", "write_file", "patch"})
+# 路径作用域工具 - 当目标路径独立时可以并发执行
+# 这些工具的操作范围受文件路径限制，只要路径不冲突就可以并行
+_PATH_SCOPED_TOOLS = frozenset({
+    "read_file",   # 文件读取 - 可以并发读取不同文件
+    "write_file",  # 文件写入 - 可以并发写入不同文件
+    "patch"        # 文件修补 - 可以并发修改不同文件
+})
 
-# Maximum number of concurrent worker threads for parallel tool execution.
+# 并行工具执行的最大工作线程数
+# 这个限制平衡了并发性能和系统资源消耗
+# 设置过高可能导致系统资源耗尽，设置过低影响并行效率
 _MAX_TOOL_WORKERS = 8
 
-# Patterns that indicate a terminal command may modify/delete files.
+# 破坏性命令检测模式 - 安全保护机制
+# 这些正则表达式用于识别可能修改或删除文件的终端命令
+
+# 可能修改或删除文件的终端命令模式
+# 这个正则表达式匹配常见的文件破坏性操作命令
 _DESTRUCTIVE_PATTERNS = re.compile(
     r"""(?:^|\s|&&|\|\||;|`)(?:
         rm\s|rmdir\s|
@@ -244,21 +370,51 @@ _DESTRUCTIVE_PATTERNS = re.compile(
         shred\s|
         git\s+(?:reset|clean|checkout)\s
     )""",
-    re.VERBOSE,
+    re.VERBOSE,  # 使用详细模式，允许注释和格式化
 )
-# Output redirects that overwrite files (> but not >>)
+
+# 输出重定向覆盖模式 - 检测文件覆盖操作
+# 匹配 > 重定向但不匹配 >> 追加（> 会覆盖文件内容）
 _REDIRECT_OVERWRITE = re.compile(r'[^>]>[^>]|^>[^>]')
 
 
 def _is_destructive_command(cmd: str) -> bool:
-    """Heuristic: does this terminal command look like it modifies/deletes files?"""
-    if not cmd:
+    """启发式检测：这个终端命令是否看起来会修改/删除文件？
+    
+    这个函数是安全机制的一部分，用于在执行终端命令前评估其潜在风险。
+    它不是绝对可靠的，但可以捕获大多数常见的破坏性操作模式。
+    
+    检测原理：
+    1. 检查命令中是否包含已知的破坏性命令模式（rm, mv, sed -i 等）
+    2. 检查是否使用了覆盖重定向（> 而不是 >>）
+    
+    这种启发式检测的价值在于：
+    - 提前警告：在执行前识别潜在风险
+    - 用户确认：对于破坏性操作要求额外确认
+    - 审计记录：记录可能的破坏性操作用于安全审计
+    
+    Args:
+        cmd: 要检测的终端命令字符串
+        
+    Returns:
+        bool: 如果命令看起来具有破坏性返回 True，否则返回 False
+    """
+    # 基础安全检查 - 空命令直接返回安全
+    if not cmd:  # 空命令不可能是破坏性的
         return False
-    if _DESTRUCTIVE_PATTERNS.search(cmd):
+    
+    # 第一重检查：破坏性命令模式检测
+    # 使用预编译的正则表达式快速识别常见的危险命令
+    if _DESTRUCTIVE_PATTERNS.search(cmd):  # 检查破坏性命令模式
         return True
-    if _REDIRECT_OVERWRITE.search(cmd):
+    
+    # 第二重检查：输出重定向覆盖检测
+    # 识别可能意外覆盖文件的重定向操作（> 但不包括 >>）
+    if _REDIRECT_OVERWRITE.search(cmd):  # 检查覆盖重定向
         return True
-    return False
+    
+    # 通过所有安全检查，命令看起来是安全的
+    return False  # 没有发现破坏性特征
 
 
 def _should_parallelize_tool_batch(tool_calls) -> bool:
@@ -266,23 +422,30 @@ def _should_parallelize_tool_batch(tool_calls) -> bool:
     if len(tool_calls) <= 1:
         return False
 
+    # 提取所有工具名称用于快速检查
     tool_names = [tc.function.name for tc in tool_calls]
-    if any(name in _NEVER_PARALLEL_TOOLS for name in tool_names):
+    if any(name in _NEVER_PARALLEL_TOOLS for name in tool_names):  # 检查是否有禁止并行的工具
         return False
 
+    # 路径预留机制 - 用于检测文件操作的路径冲突
     reserved_paths: list[Path] = []
+    
+    # 逐个分析每个工具调用的并发安全性
     for tool_call in tool_calls:
-        tool_name = tool_call.function.name
+        tool_name = tool_call.function.name  # 获取工具名称
+        
         try:
+            # 解析工具参数，用于进一步分析
             function_args = json.loads(tool_call.function.arguments)
         except Exception:
+            # 参数解析失败，无法判断安全性，默认采用保守的串行执行
             logging.debug(
                 "Could not parse args for %s — defaulting to sequential; raw=%s",
                 tool_name,
                 tool_call.function.arguments[:200],
             )
             return False
-        if not isinstance(function_args, dict):
+        if not isinstance(function_args, dict):  # 参数必须是字典格式
             logging.debug(
                 "Non-dict args for %s (%s) — defaulting to sequential",
                 tool_name,
@@ -290,18 +453,24 @@ def _should_parallelize_tool_batch(tool_calls) -> bool:
             )
             return False
 
+        # 路径作用域工具的特殊处理 - 检查路径冲突
         if tool_name in _PATH_SCOPED_TOOLS:
+            # 提取工具的目标路径
             scoped_path = _extract_parallel_scope_path(tool_name, function_args)
-            if scoped_path is None:
+            if scoped_path is None:  # 无法确定路径，采用保守策略
                 return False
+            # 检查是否与已预留的路径冲突
             if any(_paths_overlap(scoped_path, existing) for existing in reserved_paths):
-                return False
+                return False  # 路径冲突，不能并行
+            # 预留这个路径，防止后续工具冲突
             reserved_paths.append(scoped_path)
-            continue
+            continue  # 这个工具可以并行，继续检查下一个
 
+        # 检查工具是否在安全并行白名单中
         if tool_name not in _PARALLEL_SAFE_TOOLS:
-            return False
+            return False  # 不在白名单中的工具默认串行执行
 
+    # 所有检查都通过，可以安全并行执行
     return True
 
 
@@ -378,79 +547,138 @@ def _sanitize_messages_surrogates(messages: list) -> bool:
 
 
 def _strip_budget_warnings_from_history(messages: list) -> None:
-    """Remove budget pressure warnings from tool-result messages in-place.
-
-    Budget warnings are turn-scoped signals that must not leak into replayed
-    history.  They live in tool-result ``content`` either as a JSON key
-    (``_budget_warning``) or appended plain text.
+    """从工具结果消息中移除预算压力警告 - 历史记录清理机制。
+    
+    预算警告是会话范围内的信号，绝不能泄露到重放的历史记录中。
+    它们存在于工具结果 content 中，要么是 JSON 键（_budget_warning），
+    要么是附加的纯文本。
+    
+    设计原理：
+    - 预算警告是临时性的系统提示，用于提醒智能体注意迭代次数限制
+    - 这些警告不应该成为永久对话历史的一部分，否则会污染真实的对话内容
+    - 清理机制确保历史记录的纯净性，便于后续分析和重放
+    
+    实现方式：
+    1. JSON 格式：检查并删除 _budget_warning 键
+    2. 文本格式：使用正则表达式移除预算警告文本模式
+    3. 原地修改：直接修改消息列表，避免创建新对象的开销
+    
+    这种清理的价值在于：
+    - 数据纯净性：保持对话历史的真实性和完整性
+    - 分析准确性：确保后续分析不会受到系统警告的干扰
+    - 用户体验：避免预算相关的内部信息泄露给用户
     """
+    # 遍历所有消息，查找需要清理的工具结果
     for msg in messages:
+        # 只处理工具角色的消息，跳过其他类型的消息
         if not isinstance(msg, dict) or msg.get("role") != "tool":
             continue
+            
         content = msg.get("content")
+        # 快速检查：如果内容不包含预算警告相关的关键词，直接跳过
         if not isinstance(content, str) or "_budget_warning" not in content and "[BUDGET" not in content:
             continue
 
-        # Try JSON first (the common case: _budget_warning key in a dict)
+        # 首先尝试 JSON 格式清理（最常见的情况：_budget_warning 键在字典中）
         try:
-            parsed = json.loads(content)
+            parsed = json.loads(content)  # 尝试解析为 JSON
             if isinstance(parsed, dict) and "_budget_warning" in parsed:
+                # 找到预算警告键，删除它
                 del parsed["_budget_warning"]
+                # 重新序列化为 JSON 字符串
                 msg["content"] = json.dumps(parsed, ensure_ascii=False)
-                continue
+                continue  # 成功处理，继续下一条消息
         except (json.JSONDecodeError, TypeError):
+            # JSON 解析失败，回退到文本模式清理
             pass
 
-        # Fallback: strip the text pattern from plain-text tool results
+        # 回退方案：使用正则表达式从纯文本工具结果中移除预算警告模式
         cleaned = _BUDGET_WARNING_RE.sub("", content).strip()
         if cleaned != content:
+            # 如果清理后的内容与原始内容不同，说明移除了警告
             msg["content"] = cleaned
 
 
 # =========================================================================
-# Large tool result handler — save oversized output to temp file
+# 大工具结果处理器 — 将超大输出保存到临时文件
 # =========================================================================
 
-# Threshold at which tool results are saved to a file instead of kept inline.
-# 100K chars ≈ 25K tokens — generous for any reasonable output but prevents
-# catastrophic context explosions.
+# 大结果处理的背景：
+# 在 AI 智能体系统中，工具可能会返回非常大的结果（如日志文件、代码分析、大量数据等）。
+# 如果将这些大结果直接包含在对话上下文中，会导致：
+# - 上下文爆炸：迅速消耗可用的令牌配额
+# - 性能下降：大文本的处理和传输会显著降低响应速度
+# - 成本增加：更多的令牌意味着更高的 API 调用成本
+# - 质量降低：大上下文可能稀释重要信息，影响模型理解
+
+# 工具结果被保存到文件而不是内联保存的阈值。
+# 100K 字符 ≈ 25K 令牌 — 对于任何合理的输出都很充裕，但能防止灾难性的上下文爆炸。
 _LARGE_RESULT_CHARS = 100_000
 
-# How many characters of the original result to include as an inline preview
-# so the model has immediate context about what the tool returned.
+# 原始结果中作为内联预览包含的字符数，
+# 这样模型可以立即获得工具返回内容的上下文。
+# 1500 字符足够提供有意义的预览，同时不会显著增加上下文负担。
 _LARGE_RESULT_PREVIEW_CHARS = 1_500
 
 
 def _save_oversized_tool_result(function_name: str, function_result: str) -> str:
-    """Replace oversized tool results with a file reference + preview.
-
-    When a tool returns more than ``_LARGE_RESULT_CHARS`` characters, the full
-    content is written to a temporary file under ``HERMES_HOME/cache/tool_responses/``
-    and the result sent to the model is replaced with:
-      • a brief head preview  (first ``_LARGE_RESULT_PREVIEW_CHARS`` chars)
-      • the file path so the model can use ``read_file`` / ``search_files``
-
-    Falls back to destructive truncation if the file write fails.
+    """将超大的工具结果替换为文件引用 + 预览。
+    
+    当工具返回的内容超过 _LARGE_RESULT_CHARS 字符时，完整内容会被写入
+    HERMES_HOME/cache/tool_responses/ 下的临时文件，发送给模型的结果被替换为：
+       • 一个简短的前端预览（前 _LARGE_RESULT_PREVIEW_CHARS 个字符）
+       • 文件路径，以便模型可以使用 read_file / search_files 访问完整内容
+    
+    如果文件写入失败，则回退到破坏性截断。
+    
+    设计原理：
+    - 透明性：对模型来说，这个过程应该是透明的，它仍然可以访问完整数据
+    - 效率性：避免在 API 调用中传输大量文本数据
+    - 可靠性：提供文件写入失败的回退机制
+    - 可访问性：模型可以通过文件工具重新获取完整数据
+    
+    工作流程：
+    1. 检查结果大小是否超过阈值
+    2. 如果超过，创建临时文件保存完整内容
+    3. 生成包含预览和文件路径的替代消息
+    4. 如果文件写入失败，回退到截断模式
+    
+    Args:
+        function_name: 工具函数的名称，用于生成文件名
+        function_result: 工具的完整输出结果
+        
+    Returns:
+        str: 处理后的结果，可能是原始结果、预览+文件路径、或截断版本
     """
+    # 首先检查结果大小，如果未超过阈值直接返回原始结果
     original_len = len(function_result)
     if original_len <= _LARGE_RESULT_CHARS:
+        # 结果在可接受范围内，无需特殊处理
         return function_result
 
-    # Build the target directory
+    # 构建目标目录结构
     try:
+        # 创建缓存目录：~/.hermes/cache/tool_responses/
         response_dir = os.path.join(get_hermes_home(), "cache", "tool_responses")
-        os.makedirs(response_dir, exist_ok=True)
+        os.makedirs(response_dir, exist_ok=True)  # 确保目录存在
 
+        # 生成基于时间的唯一时间戳，精确到微秒
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        # Sanitize tool name for use in filename
+        
+        # 清理工具名称，确保文件名安全
+        # 将非单词字符和非连字符替换为下划线，限制长度防止文件名过长
         safe_name = re.sub(r"[^\w\-]", "_", function_name)[:40]
-        filename = f"{safe_name}_{timestamp}.txt"
-        filepath = os.path.join(response_dir, filename)
+        filename = f"{safe_name}_{timestamp}.txt"  # 构建唯一文件名
+        filepath = os.path.join(response_dir, filename)  # 完整文件路径
 
+        # 将完整结果写入文件
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(function_result)
 
+        # 提取预览内容（前 N 个字符）
         preview = function_result[:_LARGE_RESULT_PREVIEW_CHARS]
+        
+        # 构建智能的替代消息，包含预览和文件访问信息
         return (
             f"{preview}\n\n"
             f"[Large tool response: {original_len:,} characters total — "
@@ -458,11 +686,13 @@ def _save_oversized_tool_result(function_name: str, function_result: str) -> str
             f"Full output saved to: {filepath}\n"
             f"Use read_file or search_files on that path to access the rest.]"
         )
+        
     except Exception as exc:
-        # Fall back to destructive truncation if file write fails
+        # 文件写入失败时的回退策略：破坏性截断
         logger.warning("Failed to save large tool result to file: %s", exc)
+        # 提供截断版本，并说明截断原因和失败信息
         return (
-            function_result[:_LARGE_RESULT_CHARS]
+            function_result[:_LARGE_RESULT_CHARS]  # 截断到最大允许长度
             + f"\n\n[Truncated: tool response was {original_len:,} chars, "
             f"exceeding the {_LARGE_RESULT_CHARS:,} char limit. "
             f"File save failed: {exc}]"
@@ -471,10 +701,26 @@ def _save_oversized_tool_result(function_name: str, function_result: str) -> str
 
 class AIAgent:
     """
-    AI Agent with tool calling capabilities.
+    AI Agent with tool calling capabilities - 具有工具调用能力的 AI 智能体。
+    
+    这是 Hermes 的核心类，负责管理整个对话流程、工具执行和响应处理，
+    专门为支持函数调用的 AI 模型设计。
 
-    This class manages the conversation flow, tool execution, and response handling
-    for AI models that support function calling.
+    核心职责：
+    - 对话管理：维护多轮对话历史，处理上下文压缩和记忆管理
+    - 工具协调：解析工具调用请求，执行工具，处理返回结果
+    - 模型交互：与各种 AI 模型提供商通信，处理不同的 API 格式
+    - 错误恢复：处理网络错误、模型错误、工具执行错误等
+    - 资源管理：管理迭代预算、上下文限制、并发执行等
+    
+    设计架构：
+    - 模块化设计：将复杂功能分解为多个专门的组件
+    - 可扩展性：支持多种模型提供商和工具集
+    - 容错性：内置多重错误恢复和安全检查机制
+    - 性能优化：支持并发执行、缓存、压缩等优化手段
+    
+    这个类是构建可靠、高效 AI 智能体系统的基础，它抽象了底层复杂性，
+    为上层应用提供了简洁而强大的接口。
     """
 
     @property
@@ -496,88 +742,113 @@ class AIAgent:
         acp_args: list[str] | None = None,
         command: str = None,
         args: list[str] | None = None,
-        model: str = "",
-        max_iterations: int = 90,  # Default tool-calling iterations (shared with subagents)
-        tool_delay: float = 1.0,
-        enabled_toolsets: List[str] = None,
-        disabled_toolsets: List[str] = None,
-        save_trajectories: bool = False,
-        verbose_logging: bool = False,
-        quiet_mode: bool = False,
-        ephemeral_system_prompt: str = None,
-        log_prefix_chars: int = 100,
-        log_prefix: str = "",
-        providers_allowed: List[str] = None,
-        providers_ignored: List[str] = None,
-        providers_order: List[str] = None,
-        provider_sort: str = None,
-        provider_require_parameters: bool = False,
-        provider_data_collection: str = None,
-        session_id: str = None,
-        tool_progress_callback: callable = None,
-        tool_start_callback: callable = None,
-        tool_complete_callback: callable = None,
-        thinking_callback: callable = None,
-        reasoning_callback: callable = None,
-        clarify_callback: callable = None,
-        step_callback: callable = None,
-        stream_delta_callback: callable = None,
-        tool_gen_callback: callable = None,
-        status_callback: callable = None,
-        max_tokens: int = None,
-        reasoning_config: Dict[str, Any] = None,
-        prefill_messages: List[Dict[str, Any]] = None,
-        platform: str = None,
-        skip_context_files: bool = False,
-        skip_memory: bool = False,
-        session_db=None,
-        parent_session_id: str = None,
-        iteration_budget: "IterationBudget" = None,
-        fallback_model: Dict[str, Any] = None,
-        credential_pool=None,
-        checkpoints_enabled: bool = False,
-        checkpoint_max_snapshots: int = 50,
-        pass_session_id: bool = False,
-        persist_session: bool = True,
+        model: str = "",  # 默认模型名称
+        max_iterations: int = 90,  # 默认工具调用迭代次数（与子智能体共享）
+        tool_delay: float = 1.0,  # 工具调用间隔延迟
+        enabled_toolsets: List[str] = None,  # 启用的工具集白名单
+        disabled_toolsets: List[str] = None,  # 禁用的工具集黑名单
+        save_trajectories: bool = False,  # 是否保存对话轨迹到 JSONL 文件
+        verbose_logging: bool = False,  # 是否启用详细日志用于调试
+        quiet_mode: bool = False,  # 是否抑制进度输出以获得干净的 CLI 体验
+        ephemeral_system_prompt: str = None,  # 执行期间使用的临时系统提示（不保存到轨迹）
+        log_prefix_chars: int = 100,  # 日志预览显示的字符数
+        log_prefix: str = "",  # 日志消息前缀，用于并行处理中的标识
+        providers_allowed: List[str] = None,  # 允许的 OpenRouter 提供商
+        providers_ignored: List[str] = None,  # 忽略的 OpenRouter 提供商
+        providers_order: List[str] = None,  # OpenRouter 提供商尝试顺序
+        provider_sort: str = None,  # 按价格/吞吐量/延迟排序提供商
+        provider_require_parameters: bool = False,  # 是否要求提供商参数
+        provider_data_collection: str = None,  # 提供商数据收集配置
+        session_id: str = None,  # 会话 ID，用于日志记录
+        tool_progress_callback: callable = None,  # 工具进度回调函数
+        tool_start_callback: callable = None,  # 工具开始回调函数
+        tool_complete_callback: callable = None,  # 工具完成回调函数
+        thinking_callback: callable = None,  # 思考过程回调函数
+        reasoning_callback: callable = None,  # 推理过程回调函数
+        clarify_callback: callable = None,  # 澄清交互回调函数
+        step_callback: callable = None,  # 步骤回调函数
+        stream_delta_callback: callable = None,  # 流式增量回调函数
+        tool_gen_callback: callable = None,  # 工具生成回调函数
+        status_callback: callable = None,  # 状态回调函数
+        max_tokens: int = None,  # 最大响应令牌数
+        reasoning_config: Dict[str, Any] = None,  # 推理配置
+        prefill_messages: List[Dict[str, Any]] = None,  # 预填充消息
+        platform: str = None,  # 平台标识（cli、telegram、discord、whatsapp 等）
+        skip_context_files: bool = False,  # 是否跳过上下文文件注入
+        skip_memory: bool = False,  # 是否跳过记忆系统
+        session_db=None,  # 会话数据库
+        parent_session_id: str = None,  # 父会话 ID
+        iteration_budget: "IterationBudget" = None,  # 迭代预算对象
+        fallback_model: Dict[str, Any] = None,  # 回退模型配置
+        credential_pool=None,  # 凭据池
+        checkpoints_enabled: bool = False,  # 是否启用检查点
+        checkpoint_max_snapshots: int = 50,  # 检查点最大快照数
+        pass_session_id: bool = False,  # 是否传递会话 ID
+        persist_session: bool = True,  # 是否持久化会话
     ):
         """
-        Initialize the AI Agent.
-
+        初始化 AI 智能体 - 构建完整的智能体运行环境。
+        
+        这是 AIAgent 的核心构造函数，负责设置智能体运行所需的所有组件和配置。
+        该方法处理了从模型配置到安全设置的完整初始化流程，是构建功能完整的
+        AI 智能体的入口点。
+        
+        参数设计哲学：
+        - 灵活性：支持多种模型提供商和配置选项
+        - 可扩展性：通过回调函数支持自定义行为
+        - 安全性：内置多重安全机制和限制
+        - 性能优化：支持并发、缓存、压缩等优化手段
+        
+        关键配置类别：
+        1. 模型配置：base_url、api_key、provider、model 等
+        2. 行为控制：max_iterations、tool_delay、enabled_toolsets 等
+        3. 用户体验：quiet_mode、verbose_logging、platform 等
+        4. 回调系统：各种 callback 函数用于自定义行为
+        5. 高级功能：reasoning_config、prefill_messages、checkpoints_enabled 等
+        
+        初始化流程：
+        1. 安全标准输出安装
+        2. 基础属性设置
+        3. 模型客户端配置
+        4. 日志系统设置
+        5. 高级功能初始化
+        6. 回调和状态管理设置
+        
         Args:
-            base_url (str): Base URL for the model API (optional)
-            api_key (str): API key for authentication (optional, uses env var if not provided)
-            provider (str): Provider identifier (optional; used for telemetry/routing hints)
-            api_mode (str): API mode override: "chat_completions" or "codex_responses"
-            model (str): Model name to use (default: "anthropic/claude-opus-4.6")
-            max_iterations (int): Maximum number of tool calling iterations (default: 90)
-            tool_delay (float): Delay between tool calls in seconds (default: 1.0)
-            enabled_toolsets (List[str]): Only enable tools from these toolsets (optional)
-            disabled_toolsets (List[str]): Disable tools from these toolsets (optional)
-            save_trajectories (bool): Whether to save conversation trajectories to JSONL files (default: False)
-            verbose_logging (bool): Enable verbose logging for debugging (default: False)
-            quiet_mode (bool): Suppress progress output for clean CLI experience (default: False)
-            ephemeral_system_prompt (str): System prompt used during agent execution but NOT saved to trajectories (optional)
-            log_prefix_chars (int): Number of characters to show in log previews for tool calls/responses (default: 100)
-            log_prefix (str): Prefix to add to all log messages for identification in parallel processing (default: "")
-            providers_allowed (List[str]): OpenRouter providers to allow (optional)
-            providers_ignored (List[str]): OpenRouter providers to ignore (optional)
-            providers_order (List[str]): OpenRouter providers to try in order (optional)
-            provider_sort (str): Sort providers by price/throughput/latency (optional)
-            session_id (str): Pre-generated session ID for logging (optional, auto-generated if not provided)
-            tool_progress_callback (callable): Callback function(tool_name, args_preview) for progress notifications
-            clarify_callback (callable): Callback function(question, choices) -> str for interactive user questions.
-                Provided by the platform layer (CLI or gateway). If None, the clarify tool returns an error.
-            max_tokens (int): Maximum tokens for model responses (optional, uses model default if not set)
-            reasoning_config (Dict): OpenRouter reasoning configuration override (e.g. {"effort": "none"} to disable thinking).
-                If None, defaults to {"enabled": True, "effort": "medium"} for OpenRouter. Set to disable/customize reasoning.
-            prefill_messages (List[Dict]): Messages to prepend to conversation history as prefilled context.
-                Useful for injecting a few-shot example or priming the model's response style.
-                Example: [{"role": "user", "content": "Hi!"}, {"role": "assistant", "content": "Hello!"}]
-            platform (str): The interface platform the user is on (e.g. "cli", "telegram", "discord", "whatsapp").
-                Used to inject platform-specific formatting hints into the system prompt.
-            skip_context_files (bool): If True, skip auto-injection of SOUL.md, AGENTS.md, and .cursorrules
-                into the system prompt. Use this for batch processing and data generation to avoid
-                polluting trajectories with user-specific persona or project instructions.
+            base_url (str): 模型 API 的基础 URL（可选）
+            api_key (str): 身份验证的 API 密钥（可选，如果未提供则使用环境变量）
+            provider (str): 提供商标识符（可选；用于遥测/路由提示）
+            api_mode (str): API 模式覆盖："chat_completions" 或 "codex_responses"
+            model (str): 要使用的模型名称（默认："anthropic/claude-opus-4.6"）
+            max_iterations (int): 工具调用迭代的最大数量（默认：90）
+            tool_delay (float): 工具调用之间的延迟（秒）（默认：1.0）
+            enabled_toolsets (List[str]): 仅启用这些工具集中的工具（可选）
+            disabled_toolsets (List[str]): 禁用这些工具集中的工具（可选）
+            save_trajectories (bool): 是否将对话轨迹保存到 JSONL 文件（默认：False）
+            verbose_logging (bool): 启用详细日志记录以进行调试（默认：False）
+            quiet_mode (bool): 抑制进度输出以获得干净的 CLI 体验（默认：False）
+            ephemeral_system_prompt (str): 智能体执行期间使用但不保存到轨迹的系统提示（可选）
+            log_prefix_chars (int): 工具调用/响应的日志预览中显示的字符数（默认：100）
+            log_prefix (str): 添加到所有日志消息的前缀，用于并行处理中的标识（默认：""）
+            providers_allowed (List[str]): 允许的 OpenRouter 提供商（可选）
+            providers_ignored (List[str]): 忽略的 OpenRouter 提供商（可选）
+            providers_order (List[str]): 按顺序尝试的 OpenRouter 提供商（可选）
+            provider_sort (str): 按价格/吞吐量/延迟排序提供商（可选）
+            session_id (str): 用于日志记录的预生成会话 ID（可选，如果未提供则自动生成）
+            tool_progress_callback (callable): 进度通知的回调函数(tool_name, args_preview)
+            clarify_callback (callable): 交互式用户问题的回调函数(question, choices) -> str。
+                由平台层（CLI 或网关）提供。如果为 None，澄清工具返回错误。
+            max_tokens (int): 模型响应的最大令牌数（可选，如果未设置则使用模型默认值）
+            reasoning_config (Dict): OpenRouter 推理配置覆盖（例如 {"effort": "none"} 禁用思考）。
+                如果为 None，默认为 {"enabled": True, "effort": "medium"} 用于 OpenRouter。设置以禁用/自定义推理。
+            prefill_messages (List[Dict]): 作为预填充上下文添加到对话历史的消息。
+                用于注入少量示例或引导模型的响应风格。
+                示例：[{"role": "user", "content": "Hi!"}, {"role": "assistant", "content": "Hello!"}]
+            platform (str): 用户所在的接口平台（例如 "cli"、"telegram"、"discord"、"whatsapp"）。
+                用于将平台特定的格式提示注入系统提示。
+            skip_context_files (bool): 如果为 True，跳过 SOUL.md、AGENTS.md 和 .cursorrules 的自动注入
+                到系统提示中。用于批处理和数据生成，以避免
+                用用户特定的角色或项目指令污染轨迹。
         """
         _install_safe_stdio()
 
@@ -708,84 +979,102 @@ class AIAgent:
         # status_callback for gateway platforms.  Does NOT inject into messages.
         self._context_pressure_warned = False
 
-        # Activity tracking — updated on each API call, tool execution, and
-        # stream chunk.  Used by the gateway timeout handler to report what the
-        # agent was doing when it was killed, and by the "still working"
-        # notifications to show progress.
-        self._last_activity_ts: float = time.time()
-        self._last_activity_desc: str = "initializing"
-        self._current_tool: str | None = None
-        self._api_call_count: int = 0
+        # 活动跟踪系统 - 智能体行为监控和诊断支持
+        # 活动跟踪 —— 在每次 API 调用、工具执行和流块时更新。
+        # 由网关超时处理程序用于报告智能体被终止时在做什么，
+        # 以及由"仍在工作"通知用于显示进度。
+        self._last_activity_ts: float = time.time()  # 最后活动时间戳
+        self._last_activity_desc: str = "initializing"  # 最后活动描述
+        self._current_tool: str | None = None  # 当前正在执行的工具
+        self._api_call_count: int = 0  # API 调用计数器
 
-        # Centralized logging — agent.log (INFO+) and errors.log (WARNING+)
-        # both live under ~/.hermes/logs/.  Idempotent, so gateway mode
-        # (which creates a new AIAgent per message) won't duplicate handlers.
+        # 集中式日志系统 - 智能体运行状态记录
+        # 集中式日志 —— agent.log (INFO+) 和 errors.log (WARNING+)
+        # 都位于 ~/.hermes/logs/。幂等的，因此网关模式
+        # （每条消息创建一个新的 AIAgent）不会重复处理器。
         from hermes_logging import setup_logging, setup_verbose_logging
         setup_logging(hermes_home=_hermes_home)
 
         if self.verbose_logging:
+            # 详细日志模式：启用第三方库的详细日志
             setup_verbose_logging()
             logger.info("Verbose logging enabled (third-party library logs suppressed)")
         else:
             if self.quiet_mode:
-                # In quiet mode (CLI default), suppress all tool/infra log
-                # noise on the *console*. The TUI has its own rich display
-                # for status; logger INFO/WARNING messages just clutter it.
-                # File handlers (agent.log, errors.log) still capture everything.
+                # 在安静模式下（CLI 默认），抑制所有工具/基础设施日志
+                # 在 *控制台* 上的噪音。TUI 有自己的丰富显示
+                # 用于状态；记录器 INFO/WARNING 消息只会使其混乱。
+                # 文件处理器（agent.log、errors.log）仍然捕获所有内容。
                 for quiet_logger in [
-                    'tools',               # all tools.* (terminal, browser, web, file, etc.)
-                    'run_agent',            # agent runner internals
-                    'trajectory_compressor',
-                    'cron',                 # scheduler (only relevant in daemon mode)
-                    'hermes_cli',           # CLI helpers
+                    'tools',               # 所有 tools.*（终端、浏览器、网络、文件等）
+                    'run_agent',            # 智能体运行器内部
+                    'trajectory_compressor',  # 轨迹压缩器
+                    'cron',                 # 调度器（仅在守护程序模式下相关）
+                    'hermes_cli',           # CLI 助手
                 ]:
                     logging.getLogger(quiet_logger).setLevel(logging.ERROR)
         
-        # Internal stream callback (set during streaming TTS).
-        # Initialized here so _vprint can reference it before run_conversation.
+        # 内部流回调管理 - 流式传输支持
+        # 内部流回调（在流式 TTS 期间设置）。
+        # 在此处初始化，以便 _vprint 可以在 run_conversation 之前引用它。
         self._stream_callback = None
-        # Deferred paragraph break flag — set after tool iterations so a
-        # single "\n\n" is prepended to the next real text delta.
+        # 延迟段落分隔标志 —— 在工具迭代后设置，以便
+        # 单个 "\n\n" 被添加到下一个真实文本增量的前面。
         self._stream_needs_break = False
 
-        # Optional current-turn user-message override used when the API-facing
-        # user message intentionally differs from the persisted transcript
-        # (e.g. CLI voice mode adds a temporary prefix for the live call only).
-        self._persist_user_message_idx = None
-        self._persist_user_message_override = None
+        # 用户消息覆盖机制 - API 与持久化的差异处理
+        # 可选的当前轮次用户消息覆盖，当面向 API 的
+        # 用户消息有意不同于持久化的记录时使用
+        # （例如，CLI 语音模式仅为实时调用添加临时前缀）。
+        self._persist_user_message_idx = None  # 持久化用户消息索引
+        self._persist_user_message_override = None  # 持久化用户消息覆盖
 
-        # Cache anthropic image-to-text fallbacks per image payload/URL so a
-        # single tool loop does not repeatedly re-run auxiliary vision on the
-        # same image history.
+        # Anthropic 图像回退缓存 - 性能优化机制
+        # 缓存每个图像负载/URL 的 Anthropic 图像到文本回退，
+        # 这样单个工具循环不会重复在同一图像历史上运行辅助视觉。
+        # 这种缓存避免了重复的视觉处理调用，显著提升了性能。
         self._anthropic_image_fallback_cache: Dict[str, str] = {}
 
-        # Initialize LLM client via centralized provider router.
-        # The router handles auth resolution, base URL, headers, and
-        # Codex/Anthropic wrapping for all known providers.
-        # raw_codex=True because the main agent needs direct responses.stream()
-        # access for Codex Responses API streaming.
-        self._anthropic_client = None
-        self._is_anthropic_oauth = False
+        # LLM 客户端初始化 - 提供商路由和认证管理
+        # 通过集中式提供商路由器初始化 LLM 客户端。
+        # 路由器处理所有已知提供商的身份验证解析、基础 URL、标头、
+        # 和 Codex/Anthropic 包装。
+        # raw_codex=True，因为主智能体需要直接的 responses.stream()
+        # 访问以进行 Codex Responses API 流式传输。
+        self._anthropic_client = None  # Anthropic 客户端（延迟初始化）
+        self._is_anthropic_oauth = False  # 是否使用 Anthropic OAuth
 
         if self.api_mode == "anthropic_messages":
+            # Anthropic Messages API 模式 - 原生 Anthropic 支持
             from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
-            # Only fall back to ANTHROPIC_TOKEN when the provider is actually Anthropic.
-            # Other anthropic_messages providers (MiniMax, Alibaba, etc.) must use their own API key.
-            # Falling back would send Anthropic credentials to third-party endpoints (Fixes #1739, #minimax-401).
+            
+            # 认证策略：仅在提供商确实是 Anthropic 时才回退到 ANTHROPIC_TOKEN。
+            # 其他 anthropic_messages 提供商（MiniMax、Alibaba 等）必须使用自己的 API 密钥。
+            # 回退会将 Anthropic 凭据发送到第三方端点（修复 #1739、#minimax-401）。
             _is_native_anthropic = self.provider == "anthropic"
             effective_key = (api_key or resolve_anthropic_token() or "") if _is_native_anthropic else (api_key or "")
+            
+            # 存储有效的认证信息
             self.api_key = effective_key
             self._anthropic_api_key = effective_key
             self._anthropic_base_url = base_url
+            
+            # 检测是否使用 OAuth 令牌
             from agent.anthropic_adapter import _is_oauth_token as _is_oat
             self._is_anthropic_oauth = _is_oat(effective_key)
+            
+            # 构建 Anthropic 客户端
             self._anthropic_client = build_anthropic_client(effective_key, base_url)
-            # No OpenAI client needed for Anthropic mode
+            
+            # Anthropic 模式下不需要 OpenAI 客户端
             self.client = None
             self._client_kwargs = {}
+            
+            # 初始化成功提示（非安静模式）
             if not self.quiet_mode:
                 print(f"🤖 AI Agent initialized with model: {self.model} (Anthropic native)")
                 if effective_key and len(effective_key) > 12:
+                    # 安全地显示令牌的一部分
                     print(f"🔑 Using token: {effective_key[:8]}...{effective_key[-4:]}")
         else:
             if api_key and base_url:
@@ -811,7 +1100,7 @@ class AIAgent:
                         "User-Agent": "KimiCLI/1.3",
                     }
             else:
-                # No explicit creds — use the centralized provider router
+                # 没有显式凭据 —— 使用集中式提供商路由器
                 from agent.auxiliary_client import resolve_provider_client
                 _routed_client, _ = resolve_provider_client(
                     self.provider or "auto", model=self.model, raw_codex=True)
@@ -820,13 +1109,13 @@ class AIAgent:
                         "api_key": _routed_client.api_key,
                         "base_url": str(_routed_client.base_url),
                     }
-                    # Preserve any default_headers the router set
+                    # 保留路由器设置的任何默认标头
                     if hasattr(_routed_client, '_default_headers') and _routed_client._default_headers:
                         client_kwargs["default_headers"] = dict(_routed_client._default_headers)
                 else:
-                    # When the user explicitly chose a non-OpenRouter provider
-                    # but no credentials were found, fail fast with a clear
-                    # message instead of silently routing through OpenRouter.
+                    # 当用户明确选择了非 OpenRouter 提供商
+                    # 但未找到凭据时，快速失败并显示清晰的消息，
+                    # 而不是默默地通过 OpenRouter 路由。
                     _explicit = (self.provider or "").strip().lower()
                     if _explicit and _explicit not in ("auto", "openrouter", "custom"):
                         raise RuntimeError(
@@ -881,23 +1170,31 @@ class AIAgent:
             except Exception as e:
                 raise RuntimeError(f"Failed to initialize OpenAI client: {e}")
         
-        # Provider fallback chain — ordered list of backup providers tried
-        # when the primary is exhausted (rate-limit, overload, connection
-        # failure).  Supports both legacy single-dict ``fallback_model`` and
-        # new list ``fallback_providers`` format.
+        # 提供商回退链配置 - 容错和可靠性保障
+        # 提供商回退链 —— 当主要提供商耗尽时（速率限制、过载、连接失败）
+        # 尝试的备份提供商的有序列表。
+        # 支持传统的单个字典 fallback_model 和新的列表 fallback_providers 格式。
         if isinstance(fallback_model, list):
+            # 新格式：提供商回退链列表
             self._fallback_chain = [
                 f for f in fallback_model
                 if isinstance(f, dict) and f.get("provider") and f.get("model")
             ]
         elif isinstance(fallback_model, dict) and fallback_model.get("provider") and fallback_model.get("model"):
+            # 传统格式：单个回退模型配置
             self._fallback_chain = [fallback_model]
         else:
+            # 没有配置回退
             self._fallback_chain = []
-        self._fallback_index = 0
-        self._fallback_activated = False
-        # Legacy attribute kept for backward compat (tests, external callers)
+        
+        # 回退状态管理
+        self._fallback_index = 0  # 当前回退索引
+        self._fallback_activated = False  # 回退是否已激活
+        
+        # 传统属性保留向后兼容（测试、外部调用者）
         self._fallback_model = self._fallback_chain[0] if self._fallback_chain else None
+        
+        # 回退配置显示（非安静模式）
         if self._fallback_chain and not self.quiet_mode:
             if len(self._fallback_chain) == 1:
                 fb = self._fallback_chain[0]
@@ -6426,21 +6723,32 @@ class AIAgent:
 
             tool_start_time = time.time()
 
+            # 处理待办事项工具调用
+            # 该工具用于管理待办事项列表，支持添加、更新、删除和合并待办事项
             if function_name == "todo":
+                # 动态导入待办事项工具模块，避免循环导入
                 from tools.todo_tool import todo_tool as _todo_tool
+                # 调用待办事项工具，传入待办事项列表、合并标志和存储实例
                 function_result = _todo_tool(
                     todos=function_args.get("todos"),
                     merge=function_args.get("merge", False),
                     store=self._todo_store,
                 )
+                # 计算工具执行耗时
                 tool_duration = time.time() - tool_start_time
+                # 如果处于安静模式，输出格式化的工具执行信息
                 if self.quiet_mode:
                     self._vprint(f"  {_get_cute_tool_message_impl('todo', function_args, tool_duration, result=function_result)}")
+            # 处理会话搜索工具调用
+            # 该工具用于在当前会话历史中搜索相关内容，支持按角色过滤和限制结果数量
             elif function_name == "session_search":
+                # 检查会话数据库是否可用，如果不可用返回错误信息
                 if not self._session_db:
                     function_result = json.dumps({"success": False, "error": "Session database not available."})
                 else:
+                    # 动态导入会话搜索工具模块
                     from tools.session_search_tool import session_search as _session_search
+                    # 调用会话搜索工具，传入搜索查询、角色过滤器、结果限制数量、数据库实例和当前会话ID
                     function_result = _session_search(
                         query=function_args.get("query", ""),
                         role_filter=function_args.get("role_filter"),
@@ -6448,12 +6756,19 @@ class AIAgent:
                         db=self._session_db,
                         current_session_id=self.session_id,
                     )
+                # 计算工具执行耗时
                 tool_duration = time.time() - tool_start_time
+                # 如果处于安静模式，输出格式化的工具执行信息
                 if self.quiet_mode:
                     self._vprint(f"  {_get_cute_tool_message_impl('session_search', function_args, tool_duration, result=function_result)}")
+            # 处理内存工具调用
+            # 该工具用于管理智能体的记忆系统，支持添加、搜索、更新和删除记忆内容
             elif function_name == "memory":
+                # 获取目标存储类型，默认为"memory"
                 target = function_args.get("target", "memory")
+                # 动态导入内存工具模块
                 from tools.memory_tool import memory_tool as _memory_tool
+                # 调用内存工具，传入操作类型、目标、内容、旧文本和存储实例
                 function_result = _memory_tool(
                     action=function_args.get("action"),
                     target=target,
@@ -6461,35 +6776,58 @@ class AIAgent:
                     old_text=function_args.get("old_text"),
                     store=self._memory_store,
                 )
+                # 计算工具执行耗时
                 tool_duration = time.time() - tool_start_time
+                # 如果处于安静模式，输出格式化的工具执行信息
                 if self.quiet_mode:
                     self._vprint(f"  {_get_cute_tool_message_impl('memory', function_args, tool_duration, result=function_result)}")
+            # 处理澄清工具调用
+            # 该工具用于向用户请求澄清或确认，支持选择题和开放式问题
             elif function_name == "clarify":
+                # 动态导入澄清工具模块
                 from tools.clarify_tool import clarify_tool as _clarify_tool
+                # 调用澄清工具，传入问题、选项列表和回调函数
                 function_result = _clarify_tool(
                     question=function_args.get("question", ""),
                     choices=function_args.get("choices"),
                     callback=self.clarify_callback,
                 )
+                # 计算工具执行耗时
                 tool_duration = time.time() - tool_start_time
+                # 如果处于安静模式，输出格式化的工具执行信息
                 if self.quiet_mode:
                     self._vprint(f"  {_get_cute_tool_message_impl('clarify', function_args, tool_duration, result=function_result)}")
+            # 处理任务委托工具调用
+            # 该工具用于将复杂任务分解为子任务并委托给其他智能体处理，支持批量任务处理
             elif function_name == "delegate_task":
+                # 动态导入任务委托工具模块
                 from tools.delegate_tool import delegate_task as _delegate_task
+                # 获取任务参数，判断是否为批量任务
                 tasks_arg = function_args.get("tasks")
+                # 根据任务类型生成不同的加载提示信息
                 if tasks_arg and isinstance(tasks_arg, list):
+                    # 如果是任务列表，显示委托任务数量
                     spinner_label = f"🔀 delegating {len(tasks_arg)} tasks"
                 else:
+                    # 如果是单个目标，显示目标预览（前30个字符）
                     goal_preview = (function_args.get("goal") or "")[:30]
                     spinner_label = f"🔀 {goal_preview}" if goal_preview else "🔀 delegating"
+                # 初始化加载动画控制器
                 spinner = None
+                # 如果处于安静模式且没有工具进度回调，启动可爱的加载动画
                 if self.quiet_mode and not self.tool_progress_callback and self._should_start_quiet_spinner():
+                    # 随机选择一个可爱的等待表情
                     face = random.choice(KawaiiSpinner.KAWAII_WAITING)
+                    # 创建加载动画实例
                     spinner = KawaiiSpinner(f"{face} {spinner_label}", spinner_type='dots', print_fn=self._print_fn)
+                    # 启动加载动画
                     spinner.start()
+                # 保存委托加载动画引用，用于后续停止
                 self._delegate_spinner = spinner
+                # 初始化委托结果变量
                 _delegate_result = None
                 try:
+                    # 调用任务委托工具，传入目标、上下文、工具集、任务列表、最大迭代次数和父智能体引用
                     function_result = _delegate_task(
                         goal=function_args.get("goal"),
                         context=function_args.get("context"),
@@ -6498,38 +6836,64 @@ class AIAgent:
                         max_iterations=function_args.get("max_iterations"),
                         parent_agent=self,
                     )
+                    # 保存委托结果
                     _delegate_result = function_result
                 finally:
+                    # 清理委托加载动画引用
                     self._delegate_spinner = None
+                    # 计算工具执行耗时
                     tool_duration = time.time() - tool_start_time
+                    # 生成格式化的工具执行信息
                     cute_msg = _get_cute_tool_message_impl('delegate_task', function_args, tool_duration, result=_delegate_result)
+                    # 停止加载动画或输出执行信息
                     if spinner:
+                        # 如果有加载动画，用执行信息停止动画
                         spinner.stop(cute_msg)
                     elif self.quiet_mode:
+                        # 否则直接输出执行信息
                         self._vprint(f"  {cute_msg}")
+            # 处理内存管理器提供的工具调用
+            # 这些工具不在常规工具注册表中，而是通过内存管理器路由处理
+            # 包括 hindsight_retain、honcho_search 等内存相关工具
             elif self._memory_manager and self._memory_manager.has_tool(function_name):
-                # Memory provider tools (hindsight_retain, honcho_search, etc.)
-                # These are not in the tool registry — route through MemoryManager.
+                # 内存提供工具（hindsight_retain、honcho_search 等）
+                # 这些工具不在工具注册表中 —— 通过 MemoryManager 路由处理
+                # 初始化加载动画控制器
                 spinner = None
+                # 如果处于安静模式且没有工具进度回调，启动可爱的加载动画
                 if self.quiet_mode and not self.tool_progress_callback:
+                    # 随机选择一个可爱的等待表情
                     face = random.choice(KawaiiSpinner.KAWAII_WAITING)
+                    # 获取工具的emoji图标
                     emoji = _get_tool_emoji(function_name)
+                    # 构建工具预览信息，如果无法构建则使用工具名称
                     preview = _build_tool_preview(function_name, function_args) or function_name
+                    # 创建加载动画实例，包含表情、图标和预览信息
                     spinner = KawaiiSpinner(f"{face} {emoji} {preview}", spinner_type='dots', print_fn=self._print_fn)
+                    # 启动加载动画
                     spinner.start()
+                # 初始化内存工具结果变量
                 _mem_result = None
                 try:
+                    # 通过内存管理器处理工具调用，传入工具名称和参数
                     function_result = self._memory_manager.handle_tool_call(function_name, function_args)
+                    # 保存内存工具执行结果
                     _mem_result = function_result
                 except Exception as tool_error:
+                    # 如果内存工具执行失败，生成错误信息并记录日志
                     function_result = json.dumps({"error": f"Memory tool '{function_name}' failed: {tool_error}"})
                     logger.error("memory_manager.handle_tool_call raised for %s: %s", function_name, tool_error, exc_info=True)
                 finally:
+                    # 计算工具执行耗时
                     tool_duration = time.time() - tool_start_time
+                    # 生成格式化的工具执行信息
                     cute_msg = _get_cute_tool_message_impl(function_name, function_args, tool_duration, result=_mem_result)
+                    # 停止加载动画或输出执行信息
                     if spinner:
+                        # 如果有加载动画，用执行信息停止动画
                         spinner.stop(cute_msg)
                     elif self.quiet_mode:
+                        # 否则直接输出执行信息
                         self._vprint(f"  {cute_msg}")
             elif self.quiet_mode:
                 spinner = None
