@@ -941,42 +941,44 @@ class AIAgent:
         self._active_children = []      # Running child AIAgents (for interrupt propagation)
         self._active_children_lock = threading.Lock()
         
-        # Store OpenRouter provider preferences
-        self.providers_allowed = providers_allowed
-        self.providers_ignored = providers_ignored
-        self.providers_order = providers_order
-        self.provider_sort = provider_sort
-        self.provider_require_parameters = provider_require_parameters
-        self.provider_data_collection = provider_data_collection
+        # 存储OpenRouter提供商偏好设置
+        # 这些参数用于控制OpenRouter如何选择上游提供商
+        self.providers_allowed = providers_allowed          # 允许的提供商列表
+        self.providers_ignored = providers_ignored          # 忽略的提供商列表
+        self.providers_order = providers_order              # 提供商尝试顺序
+        self.provider_sort = provider_sort                  # 排序策略：price/throughput/latency
+        self.provider_require_parameters = provider_require_parameters  # 要求参数支持
+        self.provider_data_collection = provider_data_collection  # 数据收集策略
 
-        # Store toolset filtering options
-        self.enabled_toolsets = enabled_toolsets
-        self.disabled_toolsets = disabled_toolsets
-        
-        # Model response configuration
-        self.max_tokens = max_tokens  # None = use model default
-        self.reasoning_config = reasoning_config  # None = use default (medium for OpenRouter)
-        self.prefill_messages = prefill_messages or []  # Prefilled conversation turns
-        
-        # Anthropic prompt caching: auto-enabled for Claude models via OpenRouter.
-        # Reduces input costs by ~75% on multi-turn conversations by caching the
-        # conversation prefix. Uses system_and_3 strategy (4 breakpoints).
-        is_openrouter = self._is_openrouter_url()
-        is_claude = "claude" in self.model.lower()
-        is_native_anthropic = self.api_mode == "anthropic_messages"
-        self._use_prompt_caching = (is_openrouter and is_claude) or is_native_anthropic
-        self._cache_ttl = "5m"  # Default 5-minute TTL (1.25x write cost)
-        
-        # Iteration budget pressure: warn the LLM as it approaches max_iterations.
-        # Warnings are injected into the last tool result JSON (not as separate
-        # messages) so they don't break message structure or invalidate caching.
-        self._budget_caution_threshold = 0.7   # 70% — nudge to start wrapping up
-        self._budget_warning_threshold = 0.9   # 90% — urgent, respond now
+        # 存储工具集过滤选项
+        # 工具集是工具的逻辑分组，可以按平台启用/禁用
+        self.enabled_toolsets = enabled_toolsets    # 仅启用这些工具集中的工具
+        self.disabled_toolsets = disabled_toolsets  # 禁用这些工具集中的工具
+
+        # 模型响应配置
+        self.max_tokens = max_tokens  # None = 使用模型默认值
+        self.reasoning_config = reasoning_config  # None = 使用默认值（OpenRouter为medium）
+        self.prefill_messages = prefill_messages or []  # 预填充的对话轮次
+
+        # Anthropic提示缓存：通过OpenRouter为Claude模型自动启用。
+        # 通过缓存对话前缀，在多轮对话中减少约75%的输入成本。
+        # 使用system_and_3策略（4个断点）。
+        is_openrouter = self._is_openrouter_url()  # 是否使用OpenRouter
+        is_claude = "claude" in self.model.lower()  # 是否为Claude模型
+        is_native_anthropic = self.api_mode == "anthropic_messages"  # 是否为原生Anthropic API
+        self._use_prompt_caching = (is_openrouter and is_claude) or is_native_anthropic  # 启用提示缓存
+        self._cache_ttl = "5m"  # 默认5分钟TTL（1.25倍写入成本）
+
+        # 迭代预算压力：当LLM接近max_iterations时警告。
+        # 警告被注入到最后的工具结果JSON中（而不是作为单独的消息），
+        # 这样它们不会破坏消息结构或使缓存失效。
+        self._budget_caution_threshold = 0.7   # 70% —— 提示开始收尾
+        self._budget_warning_threshold = 0.9   # 90% —— 紧急，立即响应
         self._budget_pressure_enabled = True
 
-        # Context pressure warnings: notify the USER (not the LLM) as context
-        # fills up.  Purely informational — displayed in CLI output and sent via
-        # status_callback for gateway platforms.  Does NOT inject into messages.
+        # 上下文压力警告：当上下文填满时通知用户（而不是LLM）。
+        # 纯粹是信息性的 —— 在CLI输出中显示，并通过status_callback
+        # 发送到网关平台。不会注入到消息中。
         self._context_pressure_warned = False
 
         # 活动跟踪系统 - 智能体行为监控和诊断支持
@@ -1077,34 +1079,44 @@ class AIAgent:
                     # 安全地显示令牌的一部分
                     print(f"🔑 Using token: {effective_key[:8]}...{effective_key[-4:]}")
         else:
+            # 非Anthropic Messages模式：使用OpenAI兼容的客户端
             if api_key and base_url:
-                # Explicit credentials from CLI/gateway — construct directly.
-                # The runtime provider resolver already handled auth for us.
+                # 从CLI/网关显式提供凭据 —— 直接构建。
+                # 运行时提供商解析器已经为我们处理了认证。
                 client_kwargs = {"api_key": api_key, "base_url": base_url}
+
+                # 特殊处理：Copilot ACP模式需要命令和参数
                 if self.provider == "copilot-acp":
                     client_kwargs["command"] = self.acp_command
                     client_kwargs["args"] = self.acp_args
+
                 effective_base = base_url
+
+                # 为特定提供商添加默认标头
                 if "openrouter" in effective_base.lower():
+                    # OpenRouter标头：标识应用和分类
                     client_kwargs["default_headers"] = {
                         "HTTP-Referer": "https://hermes-agent.nousresearch.com",
                         "X-OpenRouter-Title": "Hermes Agent",
                         "X-OpenRouter-Categories": "productivity,cli-agent",
                     }
                 elif "api.githubcopilot.com" in effective_base.lower():
+                    # GitHub Copilot需要特殊的标头
                     from hermes_cli.models import copilot_default_headers
-
                     client_kwargs["default_headers"] = copilot_default_headers()
                 elif "api.kimi.com" in effective_base.lower():
+                    # Kimi API需要自定义User-Agent
                     client_kwargs["default_headers"] = {
                         "User-Agent": "KimiCLI/1.3",
                     }
             else:
                 # 没有显式凭据 —— 使用集中式提供商路由器
+                # 提供商路由器会自动解析API密钥、基础URL和其他配置
                 from agent.auxiliary_client import resolve_provider_client
                 _routed_client, _ = resolve_provider_client(
                     self.provider or "auto", model=self.model, raw_codex=True)
                 if _routed_client is not None:
+                    # 使用路由器返回的客户端配置
                     client_kwargs = {
                         "api_key": _routed_client.api_key,
                         "base_url": str(_routed_client.base_url),
@@ -1113,9 +1125,9 @@ class AIAgent:
                     if hasattr(_routed_client, '_default_headers') and _routed_client._default_headers:
                         client_kwargs["default_headers"] = dict(_routed_client._default_headers)
                 else:
-                    # 当用户明确选择了非 OpenRouter 提供商
+                    # 当用户明确选择了非OpenRouter提供商
                     # 但未找到凭据时，快速失败并显示清晰的消息，
-                    # 而不是默默地通过 OpenRouter 路由。
+                    # 而不是默默地通过OpenRouter路由。
                     _explicit = (self.provider or "").strip().lower()
                     if _explicit and _explicit not in ("auto", "openrouter", "custom"):
                         raise RuntimeError(
@@ -1123,7 +1135,7 @@ class AIAgent:
                             f"was found. Set the {_explicit.upper()}_API_KEY environment "
                             f"variable, or switch to a different provider with `hermes model`."
                         )
-                    # Final fallback: try raw OpenRouter key
+                    # 最终回退：尝试原始的OpenRouter密钥
                     client_kwargs = {
                         "api_key": os.getenv("OPENROUTER_API_KEY", ""),
                         "base_url": OPENROUTER_BASE_URL,
@@ -1133,21 +1145,22 @@ class AIAgent:
                             "X-OpenRouter-Categories": "productivity,cli-agent",
                         },
                     }
-            
-            self._client_kwargs = client_kwargs  # stored for rebuilding after interrupt
 
-            # Enable fine-grained tool streaming for Claude on OpenRouter.
-            # Without this, Anthropic buffers the entire tool call and goes
-            # silent for minutes while thinking — OpenRouter's upstream proxy
-            # times out during the silence.  The beta header makes Anthropic
-            # stream tool call arguments token-by-token, keeping the
-            # connection alive.
+            self._client_kwargs = client_kwargs  # 存储以便中断后重建客户端
+
+            # 为OpenRouter上的Claude启用细粒度工具流式传输。
+            # 如果没有这个，Anthropic会缓冲整个工具调用，在思考时
+            # 沉默数分钟 —— OpenRouter的上游代理在沉默期间超时。
+            # beta标头使Anthropic逐token流式传输工具调用参数，
+            # 保持连接活跃。
             _effective_base = str(client_kwargs.get("base_url", "")).lower()
             if "openrouter" in _effective_base and "claude" in (self.model or "").lower():
+                # 检查并添加细粒度工具流式传输的beta标头
                 headers = client_kwargs.get("default_headers") or {}
                 existing_beta = headers.get("x-anthropic-beta", "")
                 _FINE_GRAINED = "fine-grained-tool-streaming-2025-05-14"
                 if _FINE_GRAINED not in existing_beta:
+                    # 如果已有其他beta特性，用逗号连接；否则直接设置
                     if existing_beta:
                         headers["x-anthropic-beta"] = f"{existing_beta},{_FINE_GRAINED}"
                     else:
@@ -1156,12 +1169,14 @@ class AIAgent:
 
             self.api_key = client_kwargs.get("api_key", "")
             try:
+                # 创建OpenAI客户端实例
                 self.client = self._create_openai_client(client_kwargs, reason="agent_init", shared=True)
                 if not self.quiet_mode:
+                    # 显示初始化信息
                     print(f"🤖 AI Agent initialized with model: {self.model}")
                     if base_url:
                         print(f"🔗 Using custom base URL: {base_url}")
-                    # Always show API key info (masked) for debugging auth issues
+                    # 始终显示API密钥信息（已遮罩）以便调试认证问题
                     key_used = client_kwargs.get("api_key", "none")
                     if key_used and key_used != "dummy-key" and len(key_used) > 12:
                         print(f"🔑 Using API key: {key_used[:8]}...{key_used[-4:]}")
@@ -1203,86 +1218,92 @@ class AIAgent:
                 print(f"🔄 Fallback chain ({len(self._fallback_chain)} providers): " +
                       " → ".join(f"{f['model']} ({f['provider']})" for f in self._fallback_chain))
 
-        # Get available tools with filtering
+        # 获取可用工具并进行过滤
+        # 根据启用的工具集和禁用的工具集筛选工具
         self.tools = get_tool_definitions(
             enabled_toolsets=enabled_toolsets,
             disabled_toolsets=disabled_toolsets,
             quiet_mode=self.quiet_mode,
         )
-        
-        # Show tool configuration and store valid tool names for validation
+
+        # 显示工具配置并存储有效的工具名称用于验证
         self.valid_tool_names = set()
         if self.tools:
+            # 提取所有工具名称
             self.valid_tool_names = {tool["function"]["name"] for tool in self.tools}
             tool_names = sorted(self.valid_tool_names)
             if not self.quiet_mode:
                 print(f"🛠️  Loaded {len(self.tools)} tools: {', '.join(tool_names)}")
-                
-                # Show filtering info if applied
+
+                # 如果应用了过滤，显示过滤信息
                 if enabled_toolsets:
                     print(f"   ✅ Enabled toolsets: {', '.join(enabled_toolsets)}")
                 if disabled_toolsets:
                     print(f"   ❌ Disabled toolsets: {', '.join(disabled_toolsets)}")
         elif not self.quiet_mode:
             print("🛠️  No tools loaded (all tools filtered out or unavailable)")
-        
-        # Check tool requirements
+
+        # 检查工具要求（如API密钥、依赖项等）
         if self.tools and not self.quiet_mode:
             requirements = check_toolset_requirements()
             missing_reqs = [name for name, available in requirements.items() if not available]
             if missing_reqs:
                 print(f"⚠️  Some tools may not work due to missing requirements: {missing_reqs}")
-        
-        # Show trajectory saving status
+
+        # 显示轨迹保存状态
         if self.save_trajectories and not self.quiet_mode:
             print("📝 Trajectory saving enabled")
-        
-        # Show ephemeral system prompt status
+
+        # 显示临时系统提示状态
         if self.ephemeral_system_prompt and not self.quiet_mode:
             prompt_preview = self.ephemeral_system_prompt[:60] + "..." if len(self.ephemeral_system_prompt) > 60 else self.ephemeral_system_prompt
             print(f"🔒 Ephemeral system prompt: '{prompt_preview}' (not saved to trajectories)")
-        
-        # Show prompt caching status
+
+        # 显示提示缓存状态
         if self._use_prompt_caching and not self.quiet_mode:
             source = "native Anthropic" if is_native_anthropic else "Claude via OpenRouter"
             print(f"💾 Prompt caching: ENABLED ({source}, {self._cache_ttl} TTL)")
-        
-        # Session logging setup - auto-save conversation trajectories for debugging
+
+        # 会话日志设置 - 自动保存对话轨迹用于调试
         self.session_start = datetime.now()
         if session_id:
-            # Use provided session ID (e.g., from CLI)
+            # 使用提供的会话ID（例如来自CLI）
             self.session_id = session_id
         else:
-            # Generate a new session ID
+            # 生成新的会话ID：时间戳_短UUID
             timestamp_str = self.session_start.strftime("%Y%m%d_%H%M%S")
             short_uuid = uuid.uuid4().hex[:6]
             self.session_id = f"{timestamp_str}_{short_uuid}"
-        
-        # Session logs go into ~/.hermes/sessions/ alongside gateway sessions
+
+        # 会话日志存储在~/.hermes/sessions/，与网关会话并列
         hermes_home = get_hermes_home()
         self.logs_dir = hermes_home / "sessions"
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.session_log_file = self.logs_dir / f"session_{self.session_id}.json"
-        
-        # Track conversation messages for session logging
+
+        # 跟踪会话日志的对话消息
         self._session_messages: List[Dict[str, Any]] = []
-        
-        # Cached system prompt -- built once per session, only rebuilt on compression
+
+        # 缓存的系统提示 —— 每个会话构建一次，仅在压缩时重建
+        # 这是性能优化的关键：避免每次API调用都重新构建系统提示
         self._cached_system_prompt: Optional[str] = None
-        
-        # Filesystem checkpoint manager (transparent — not a tool)
+
+        # 文件系统检查点管理器（透明的 —— 不是工具）
+        # 检查点用于保存和恢复文件系统状态，支持撤销操作
         from tools.checkpoint_manager import CheckpointManager
         self._checkpoint_mgr = CheckpointManager(
             enabled=checkpoints_enabled,
             max_snapshots=checkpoint_max_snapshots,
         )
-        
-        # SQLite session store (optional -- provided by CLI or gateway)
+
+        # SQLite会话存储（可选 —— 由CLI或网关提供）
+        # 提供持久化的会话管理，支持会话搜索和历史
         self._session_db = session_db
         self._parent_session_id = parent_session_id
-        self._last_flushed_db_idx = 0  # tracks DB-write cursor to prevent duplicate writes
+        self._last_flushed_db_idx = 0  # 跟踪DB写入游标以防止重复写入
         if self._session_db:
             try:
+                # 在数据库中创建会话记录
                 self._session_db.create_session(
                     session_id=self.session_id,
                     source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
@@ -1296,35 +1317,36 @@ class AIAgent:
                     parent_session_id=self._parent_session_id,
                 )
             except Exception as e:
-                # Transient SQLite lock contention (e.g. CLI and gateway writing
-                # concurrently) must NOT permanently disable session_search for
-                # this agent.  Keep _session_db alive — subsequent message
-                # flushes and session_search calls will still work once the
-                # lock clears.  The session row may be missing from the index
-                # for this run, but that is recoverable (flushes upsert rows).
+                # 暂时的SQLite锁争用（例如CLI和网关并发写入）
+                # 绝不能永久禁用此agent的session_search。
+                # 保持_session_db存活 —— 一旦锁清除，后续的消息刷新
+                # 和session_search调用仍然可以工作。
+                # 会话行可能在此运行期间从索引中丢失，但这是可恢复的
+                # （刷新会upsert行）。
                 logger.warning(
                     "Session DB create_session failed (session_search still available): %s", e
                 )
-        
-        # In-memory todo list for task planning (one per agent/session)
+
+        # 内存中的待办事项列表，用于任务规划（每个agent/会话一个）
         from tools.todo_tool import TodoStore
         self._todo_store = TodoStore()
-        
-        # Load config once for memory, skills, and compression sections
+
+        # 加载配置一次，用于memory、skills和compression部分
         try:
             from hermes_cli.config import load_config as _load_agent_config
             _agent_cfg = _load_agent_config()
         except Exception:
             _agent_cfg = {}
 
-        # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
-        self._memory_store = None
-        self._memory_enabled = False
-        self._user_profile_enabled = False
-        self._memory_nudge_interval = 10
-        self._memory_flush_min_turns = 6
-        self._turns_since_memory = 0
-        self._iters_since_skill = 0
+        # 持久化内存系统（MEMORY.md + USER.md）—— 从磁盘加载
+        # 这是Hermes的自改进核心：agent可以跨会话记住用户和上下文
+        self._memory_store = None  # 内存存储实例
+        self._memory_enabled = False  # 是否启用MEMORY.md
+        self._user_profile_enabled = False  # 是否启用USER.md
+        self._memory_nudge_interval = 10  # 内存提醒间隔（轮次）
+        self._memory_flush_min_turns = 6  # 内存刷新的最小轮次
+        self._turns_since_memory = 0  # 自上次内存操作以来的轮次
+        self._iters_since_skill = 0  # 自上次技能操作以来的迭代次数
         if not skip_memory:
             try:
                 mem_config = _agent_cfg.get("memory", {})
@@ -1335,34 +1357,33 @@ class AIAgent:
                 if self._memory_enabled or self._user_profile_enabled:
                     from tools.memory_tool import MemoryStore
                     self._memory_store = MemoryStore(
-                        memory_char_limit=mem_config.get("memory_char_limit", 2200),
-                        user_char_limit=mem_config.get("user_char_limit", 1375),
+                        memory_char_limit=mem_config.get("memory_char_limit", 2200),  # MEMORY.md字符限制
+                        user_char_limit=mem_config.get("user_char_limit", 1375),  # USER.md字符限制
                     )
-                    self._memory_store.load_from_disk()
+                    self._memory_store.load_from_disk()  # 从磁盘加载现有内存
             except Exception:
-                pass  # Memory is optional -- don't break agent init
-        
+                pass  # 内存是可选的 —— 不要破坏agent初始化
 
 
-        # Memory provider plugin (external — one at a time, alongside built-in)
-        # Reads memory.provider from config to select which plugin to activate.
+
+        # 内存提供商插件（外部的 —— 一次一个，与内置的并列）
+        # 从config读取memory.provider以选择要激活的插件。
         self._memory_manager = None
         if not skip_memory:
             try:
                 _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
 
-                # Auto-migrate: if Honcho was actively configured (enabled +
-                # credentials) but memory.provider is not set, activate the
-                # honcho plugin automatically.  Just having the config file
-                # is not enough — the user may have disabled Honcho or the
-                # file may be from a different tool.
+                # 自动迁移：如果Honcho被主动配置（启用+凭据）
+                # 但memory.provider未设置，自动激活honcho插件。
+                # 仅拥有配置文件是不够的 —— 用户可能已禁用Honcho或
+                # 文件可能来自不同的工具。
                 if not _mem_provider_name:
                     try:
                         from plugins.memory.honcho.client import HonchoClientConfig as _HCC
                         _hcfg = _HCC.from_global_config()
                         if _hcfg.enabled and (_hcfg.api_key or _hcfg.base_url):
                             _mem_provider_name = "honcho"
-                            # Persist so this only auto-migrates once
+                            # 持久化，以便这只自动迁移一次
                             try:
                                 from hermes_cli.config import load_config as _lc, save_config as _sc
                                 _cfg = _lc()
@@ -1377,6 +1398,7 @@ class AIAgent:
                         pass
 
                 if _mem_provider_name:
+                    # 加载并初始化内存提供商插件
                     from agent.memory_manager import MemoryManager as _MemoryManager
                     from plugins.memory import load_memory_provider as _load_mem
                     self._memory_manager = _MemoryManager()
@@ -1384,6 +1406,7 @@ class AIAgent:
                     if _mp and _mp.is_available():
                         self._memory_manager.add_provider(_mp)
                     if self._memory_manager.providers:
+                        # 初始化内存管理器，传递会话上下文
                         from hermes_constants import get_hermes_home as _ghh
                         _init_kwargs = {
                             "session_id": self.session_id,
@@ -1391,7 +1414,7 @@ class AIAgent:
                             "hermes_home": str(_ghh()),
                             "agent_context": "primary",
                         }
-                        # Profile identity for per-profile provider scoping
+                        # Profile身份用于按profile范围划分提供商
                         try:
                             from hermes_cli.profiles import get_active_profile_name
                             _profile = get_active_profile_name()
@@ -1408,7 +1431,8 @@ class AIAgent:
                 logger.warning("Memory provider plugin init failed: %s", _mpe)
                 self._memory_manager = None
 
-        # Inject memory provider tool schemas into the tool surface
+        # 将内存提供商工具schema注入工具表面
+        # 这允许内存提供商提供自己的工具（如Honcho的方言用户建模）
         if self._memory_manager and self.tools is not None:
             for _schema in self._memory_manager.get_all_tool_schemas():
                 _wrapped = {"type": "function", "function": _schema}
@@ -1417,7 +1441,8 @@ class AIAgent:
                 if _tname:
                     self.valid_tool_names.add(_tname)
 
-        # Skills config: nudge interval for skill creation reminders
+        # 技能配置：技能创建提醒的提醒间隔
+        # 技能是agent从经验中学习的核心机制
         self._skill_nudge_interval = 10
         try:
             skills_config = _agent_cfg.get("skills", {})
@@ -1425,26 +1450,27 @@ class AIAgent:
         except Exception:
             pass
 
-        # Tool-use enforcement config: "auto" (default — matches hardcoded
-        # model list), true (always), false (never), or list of substrings.
+        # 工具使用强制配置："auto"（默认 —— 匹配硬编码模型列表），
+        # true（始终），false（从不），或子字符串列表。
+        # 用于强制某些模型使用工具而不是纯文本响应
         _agent_section = _agent_cfg.get("agent", {})
         if not isinstance(_agent_section, dict):
             _agent_section = {}
         self._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
 
-        # Initialize context compressor for automatic context management
-        # Compresses conversation when approaching model's context limit
-        # Configuration via config.yaml (compression section)
+        # 初始化上下文压缩器，用于自动上下文管理
+        # 当接近模型的上下文限制时压缩对话
+        # 通过config.yaml（compression部分）配置
         _compression_cfg = _agent_cfg.get("compression", {})
         if not isinstance(_compression_cfg, dict):
             _compression_cfg = {}
-        compression_threshold = float(_compression_cfg.get("threshold", 0.50))
+        compression_threshold = float(_compression_cfg.get("threshold", 0.50))  # 压缩阈值：50%
         compression_enabled = str(_compression_cfg.get("enabled", True)).lower() in ("true", "1", "yes")
-        compression_summary_model = _compression_cfg.get("summary_model") or None
-        compression_target_ratio = float(_compression_cfg.get("target_ratio", 0.20))
-        compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))
+        compression_summary_model = _compression_cfg.get("summary_model") or None  # 用于摘要的模型
+        compression_target_ratio = float(_compression_cfg.get("target_ratio", 0.20))  # 目标压缩比：20%
+        compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))  # 保护最后N条消息
 
-        # Read explicit context_length override from model config
+        # 从模型配置读取显式的context_length覆盖
         _model_cfg = _agent_cfg.get("model", {})
         if isinstance(_model_cfg, dict):
             _config_context_length = _model_cfg.get("context_length")
@@ -1456,7 +1482,8 @@ class AIAgent:
             except (TypeError, ValueError):
                 _config_context_length = None
 
-        # Check custom_providers per-model context_length
+        # 检查custom_providers中每个模型的context_length
+        # 这允许用户为自定义端点指定上下文长度
         if _config_context_length is None:
             _custom_providers = _agent_cfg.get("custom_providers")
             if isinstance(_custom_providers, list):
@@ -1476,11 +1503,12 @@ class AIAgent:
                                     except (TypeError, ValueError):
                                         pass
                         break
-        
+
+        # 创建上下文压缩器实例
         self.context_compressor = ContextCompressor(
             model=self.model,
             threshold_percent=compression_threshold,
-            protect_first_n=3,
+            protect_first_n=3,  # 始终保护前3条消息（系统提示等）
             protect_last_n=compression_protect_last,
             summary_target_ratio=compression_target_ratio,
             summary_model_override=compression_summary_model,
@@ -1491,25 +1519,28 @@ class AIAgent:
             provider=self.provider,
         )
         self.compression_enabled = compression_enabled
+        # 子目录提示追踪器：跟踪工作目录变化
         self._subdirectory_hints = SubdirectoryHintTracker(
             working_dir=os.getenv("TERMINAL_CWD") or None,
         )
-        self._user_turn_count = 0
+        self._user_turn_count = 0  # 用户轮次计数
 
-        # Cumulative token usage for the session
-        self.session_prompt_tokens = 0
-        self.session_completion_tokens = 0
-        self.session_total_tokens = 0
-        self.session_api_calls = 0
-        self.session_input_tokens = 0
-        self.session_output_tokens = 0
-        self.session_cache_read_tokens = 0
-        self.session_cache_write_tokens = 0
-        self.session_reasoning_tokens = 0
-        self.session_estimated_cost_usd = 0.0
-        self.session_cost_status = "unknown"
-        self.session_cost_source = "none"
-        
+        # 会话的累积token使用统计
+        # 这些统计用于成本估算和资源监控
+        self.session_prompt_tokens = 0  # 提示token总数
+        self.session_completion_tokens = 0  # 完成token总数
+        self.session_total_tokens = 0  # 总token数
+        self.session_api_calls = 0  # API调用次数
+        self.session_input_tokens = 0  # 输入token数
+        self.session_output_tokens = 0  # 输出token数
+        self.session_cache_read_tokens = 0  # 缓存读取token数（提示缓存）
+        self.session_cache_write_tokens = 0  # 缓存写入token数
+        self.session_reasoning_tokens = 0  # 推理token数（Claude的thinking）
+        self.session_estimated_cost_usd = 0.0  # 估算成本（美元）
+        self.session_cost_status = "unknown"  # 成本状态：unknown/estimated/actual
+        self.session_cost_source = "none"  # 成本来源：none/models.dev/usage
+
+        # 显示上下文限制信息
         if not self.quiet_mode:
             if compression_enabled:
                 print(f"📊 Context limit: {self.context_compressor.context_length:,} tokens (compress at {int(compression_threshold*100)}% = {self.context_compressor.threshold_tokens:,})")
