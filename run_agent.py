@@ -4998,73 +4998,86 @@ class AIAgent:
                                     self._fire_reasoning_delta(thinking_text)
 
                 # Return the native Anthropic Message for downstream processing
+                # 获取流的最终消息
                 return stream.get_final_message()
 
         def _call():
+            # 导入 httpx 库用于处理 HTTP 连接和超时
             import httpx as _httpx
 
+            # 从环境变量读取流式传输的最大重试次数（默认为 2）
             _max_stream_retries = int(os.getenv("HERMES_STREAM_RETRIES", 2))
 
             try:
+                # 流式传输重试循环：最多尝试 _max_stream_retries + 1 次
                 for _stream_attempt in range(_max_stream_retries + 1):
                     try:
+                        # 根据不同的 API 模式调用相应的流式方法
                         if self.api_mode == "anthropic_messages":
+                            # Anthropic Messages API 模式：刷新凭据后调用
                             self._try_refresh_anthropic_client_credentials()
                             result["response"] = _call_anthropic()
                         else:
+                            # OpenAI Chat Completions 模式
                             result["response"] = _call_chat_completions()
-                        return  # success
+                        return  # 成功完成，退出函数
                     except Exception as e:
+                        # 如果已经发送了一些 token，不再重试
+                        # 因为部分内容已经到达用户，重试会导致重复内容
                         if deltas_were_sent["yes"]:
-                            # Streaming failed AFTER some tokens were already
-                            # delivered.  Don't retry or fall back — partial
-                            # content already reached the user.
+                            # 流式传输在部分 token 已送达后失败
+                            # 不再重试或回退 —— 部分内容已到达用户
                             logger.warning(
                                 "Streaming failed after partial delivery, not retrying: %s", e
                             )
                             result["error"] = e
                             return
 
+                        # 检测不同类型的超时错误
                         _is_timeout = isinstance(
                             e, (_httpx.ReadTimeout, _httpx.ConnectTimeout, _httpx.PoolTimeout)
                         )
+                        # 检测连接错误类型
                         _is_conn_err = isinstance(
                             e, (_httpx.ConnectError, _httpx.RemoteProtocolError, ConnectionError)
                         )
 
-                        # SSE error events from proxies (e.g. OpenRouter sends
-                        # {"error":{"message":"Network connection lost."}}) are
-                        # raised as APIError by the OpenAI SDK.  These are
-                        # semantically identical to httpx connection drops —
-                        # the upstream stream died — and should be retried with
-                        # a fresh connection.  Distinguish from HTTP errors:
-                        # APIError from SSE has no status_code, while
-                        # APIStatusError (4xx/5xx) always has one.
+                        # SSE（Server-Sent Events）代理错误检测
+                        # 代理服务器（如 OpenRouter）可能发送 SSE 错误事件
+                        # 例如：{"error":{"message":"Network connection lost."}}
+                        # 这些错误会被 OpenAI SDK 包装为 APIError
+                        # 这类错误在语义上等同于 httpx 连接断开 —— 上游流已死亡
+                        # 应该使用新连接重试。区分 HTTP 错误：
+                        # 来自 SSE 的 APIError 没有 status_code，而
+                        # APIStatusError (4xx/5xx) 总是有 status_code。
                         _is_sse_conn_err = False
                         if not _is_timeout and not _is_conn_err:
                             from openai import APIError as _APIError
                             if isinstance(e, _APIError) and not getattr(e, "status_code", None):
+                                # 将错误消息转为小写以便匹配
                                 _err_lower_sse = str(e).lower()
+                                # 定义 SSE 连接错误的常见短语列表
                                 _SSE_CONN_PHRASES = (
-                                    "connection lost",
-                                    "connection reset",
-                                    "connection closed",
-                                    "connection terminated",
-                                    "network error",
-                                    "network connection",
-                                    "terminated",
-                                    "peer closed",
-                                    "broken pipe",
-                                    "upstream connect error",
+                                    "connection lost",        # 连接丢失
+                                    "connection reset",       # 连接重置
+                                    "connection closed",      # 连接关闭
+                                    "connection terminated",  # 连接终止
+                                    "network error",          # 网络错误
+                                    "network connection",     # 网络连接
+                                    "terminated",             # 已终止
+                                    "peer closed",            # 对端关闭
+                                    "broken pipe",            # 管道破裂
+                                    "upstream connect error", # 上游连接错误
                                 )
+                                # 检查错误消息是否包含任何连接错误短语
                                 _is_sse_conn_err = any(
                                     phrase in _err_lower_sse
                                     for phrase in _SSE_CONN_PHRASES
                                 )
 
+                        # 如果是超时、连接错误或 SSE 连接错误，进行重试
                         if _is_timeout or _is_conn_err or _is_sse_conn_err:
-                            # Transient network / timeout error. Retry the
-                            # streaming request with a fresh connection first.
+                            # 瞬时网络/超时错误。首先使用新连接重试流式请求。
                             if _stream_attempt < _max_stream_retries:
                                 logger.info(
                                     "Streaming attempt %s/%s failed (%s: %s), "
@@ -5074,20 +5087,20 @@ class AIAgent:
                                     type(e).__name__,
                                     e,
                                 )
+                                # 向用户显示状态消息
                                 self._emit_status(
                                     f"⚠️ Connection to provider dropped "
                                     f"({type(e).__name__}). Reconnecting… "
                                     f"(attempt {_stream_attempt + 2}/{_max_stream_retries + 1})"
                                 )
-                                # Close the stale request client before retry
+                                # 重试前关闭陈旧的请求客户端
                                 stale = request_client_holder.get("client")
                                 if stale is not None:
                                     self._close_request_openai_client(
                                         stale, reason="stream_retry_cleanup"
                                     )
                                     request_client_holder["client"] = None
-                                # Also rebuild the primary client to purge
-                                # any dead connections from the pool.
+                                # 同时重建主客户端以清除连接池中的死连接
                                 try:
                                     self._replace_primary_openai_client(
                                         reason="stream_retry_pool_cleanup"
@@ -5095,6 +5108,7 @@ class AIAgent:
                                 except Exception:
                                     pass
                                 continue
+                            # 所有重试都失败后显示错误消息
                             self._emit_status(
                                 "❌ Connection to provider failed after "
                                 f"{_max_stream_retries + 1} attempts. "
@@ -5108,12 +5122,15 @@ class AIAgent:
                                 e,
                             )
                         else:
+                            # 其他类型的错误（非网络错误）
                             _err_lower = str(e).lower()
+                            # 检测是否为"不支持流式传输"的错误
                             _is_stream_unsupported = (
                                 "stream" in _err_lower
                                 and "not supported" in _err_lower
                             )
                             if _is_stream_unsupported:
+                                # 流式传输不被此模型/提供商支持，回退到非流式
                                 self._safe_print(
                                     "\n⚠  Streaming is not supported for this "
                                     "model/provider. Falling back to non-streaming.\n"
@@ -5126,43 +5143,50 @@ class AIAgent:
                             )
 
                         try:
-                            # Reset stale timer — the non-streaming fallback
-                            # uses its own client; prevent the stale detector
-                            # from firing on stale timestamps from failed streams.
+                            # 重置陈旧计时器 —— 非流式回退使用自己的客户端
+                            # 防止陈旧检测器因失败流的陈旧时间戳而触发
                             last_chunk_time["t"] = time.time()
+                            # 回退到非流式 API 调用
                             result["response"] = self._interruptible_api_call(api_kwargs)
                         except Exception as fallback_err:
                             result["error"] = fallback_err
                         return
             finally:
+                # 清理请求客户端资源
                 request_client = request_client_holder.get("client")
                 if request_client is not None:
                     self._close_request_openai_client(request_client, reason="stream_request_complete")
 
+        # 流式传输陈旧超时配置（默认 180 秒）
         _stream_stale_timeout_base = float(os.getenv("HERMES_STREAM_STALE_TIMEOUT", 180.0))
-        # Scale the stale timeout for large contexts: slow models (like Opus)
-        # can legitimately think for minutes before producing the first token
-        # when the context is large.  Without this, the stale detector kills
-        # healthy connections during the model's thinking phase, producing
-        # spurious RemoteProtocolError ("peer closed connection").
+        # 根据上下文大小调整陈旧超时时间：慢速模型（如 Opus）
+        # 在大上下文情况下，可能需要几分钟才能生成第一个 token
+        # 如果不调整，陈旧检测器会在模型思考阶段杀死健康连接
+        # 导致虚假的 RemoteProtocolError（"对端关闭连接"）
         _est_tokens = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
         if _est_tokens > 100_000:
+            # 超大上下文：至少 5 分钟超时
             _stream_stale_timeout = max(_stream_stale_timeout_base, 300.0)
         elif _est_tokens > 50_000:
+            # 大上下文：至少 4 分钟超时
             _stream_stale_timeout = max(_stream_stale_timeout_base, 240.0)
         else:
+            # 普通上下文：使用基础超时
             _stream_stale_timeout = _stream_stale_timeout_base
 
+        # 在后台线程中执行流式调用
         t = threading.Thread(target=_call, daemon=True)
         t.start()
+        # 主线程监控流式传输状态
         while t.is_alive():
             t.join(timeout=0.3)
 
-            # Detect stale streams: connections kept alive by SSE pings
-            # but delivering no real chunks.  Kill the client so the
-            # inner retry loop can start a fresh connection.
+            # 检测陈旧的流：连接通过 SSE ping 保持活跃
+            # 但没有传递真实的块。杀死客户端以便
+            # 内部重试循环可以启动新连接
             _stale_elapsed = time.time() - last_chunk_time["t"]
             if _stale_elapsed > _stream_stale_timeout:
+                # 计算上下文大小用于日志记录
                 _est_ctx = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
                 logger.warning(
                     "Stream stale for %.0fs (threshold %.0fs) — no chunks received. "
@@ -5170,6 +5194,7 @@ class AIAgent:
                     _stale_elapsed, _stream_stale_timeout,
                     api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
                 )
+                # 向用户显示状态消息
                 self._emit_status(
                     f"⚠️ No response from provider for {int(_stale_elapsed)}s "
                     f"(model: {api_kwargs.get('model', 'unknown')}, "
@@ -5177,24 +5202,27 @@ class AIAgent:
                     f"Reconnecting..."
                 )
                 try:
+                    # 获取并关闭陈旧的请求客户端
                     rc = request_client_holder.get("client")
                     if rc is not None:
                         self._close_request_openai_client(rc, reason="stale_stream_kill")
                 except Exception:
                     pass
-                # Rebuild the primary client too — its connection pool
-                # may hold dead sockets from the same provider outage.
+                # 同时重建主客户端 —— 其连接池可能包含
+                # 来自同一提供商中断的死套接字
                 try:
                     self._replace_primary_openai_client(reason="stale_stream_pool_cleanup")
                 except Exception:
                     pass
-                # Reset the timer so we don't kill repeatedly while
-                # the inner thread processes the closure.
+                # 重置计时器，避免在内部线程处理关闭时重复杀死
                 last_chunk_time["t"] = time.time()
 
+            # 处理用户中断请求
             if self._interrupt_requested:
                 try:
+                    # 根据不同的 API 模式处理中断
                     if self.api_mode == "anthropic_messages":
+                        # Anthropic 模式：关闭并重建客户端
                         from agent.anthropic_adapter import build_anthropic_client
 
                         self._anthropic_client.close()
@@ -5203,28 +5231,32 @@ class AIAgent:
                             getattr(self, "_anthropic_base_url", None),
                         )
                     else:
+                        # OpenAI 模式：关闭请求客户端
                         request_client = request_client_holder.get("client")
                         if request_client is not None:
                             self._close_request_openai_client(request_client, reason="stream_interrupt_abort")
                 except Exception:
                     pass
+                # 抛出中断异常以停止流式传输
                 raise InterruptedError("Agent interrupted during streaming API call")
+        # 检查流式传输结果中的错误
         if result["error"] is not None:
             if deltas_were_sent["yes"]:
-                # Streaming failed AFTER some tokens were already delivered to
-                # the platform.  Re-raising would let the outer retry loop make
-                # a new API call, creating a duplicate message.  Return a
-                # partial "stop" response instead so the outer loop treats this
-                # turn as complete (no retry, no fallback).
+                # 流式传输在部分 token 已送达平台后失败
+                # 重新抛出会让外部重试循环进行新的 API 调用
+                # 导致重复消息。返回部分"停止"响应以便外部循环
+                # 将此轮次视为完成（无重试、无回退）
                 logger.warning(
                     "Partial stream delivered before error; returning stub "
                     "response to prevent duplicate messages: %s",
                     result["error"],
                 )
+                # 创建一个存根消息对象
                 _stub_msg = SimpleNamespace(
                     role="assistant", content=None, tool_calls=None,
                     reasoning_content=None,
                 )
+                # 返回一个简化的响应对象
                 return SimpleNamespace(
                     id="partial-stream-stub",
                     model=getattr(self, "model", "unknown"),
@@ -5233,7 +5265,9 @@ class AIAgent:
                     )],
                     usage=None,
                 )
+            # 如果没有发送过任何 token，直接抛出错误
             raise result["error"]
+        # 返回成功的响应
         return result["response"]
 
     # ── Provider fallback ──────────────────────────────────────────────────
@@ -7284,50 +7318,67 @@ class AIAgent:
         persist_user_message: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Run a complete conversation with tool calling until completion.
+        运行完整的对话循环，包含工具调用，直到任务完成。
+
+        这是 AIAgent 的核心方法，负责处理完整的对话流程：
+        从用户消息开始，通过多轮工具调用，直到产生最终响应。
+        该方法实现了完整的对话生命周期管理，包括上下文管理、
+        工具执行、错误恢复和会话持久化。
+
+        工作流程：
+        1. 输入验证和清理：处理代理字符、生成任务 ID 等
+        2. 会话初始化：加载历史消息、系统提示词
+        3. 上下文检查：确保不会超过模型上下文限制
+        4. 主循环：调用 LLM → 执行工具 → 返回结果，重复直到完成
+        5. 后处理：保存会话、触发后台审查（记忆/技能）
 
         Args:
-            user_message (str): The user's message/question
-            system_message (str): Custom system message (optional, overrides ephemeral_system_prompt if provided)
-            conversation_history (List[Dict]): Previous conversation messages (optional)
-            task_id (str): Unique identifier for this task to isolate VMs between concurrent tasks (optional, auto-generated if not provided)
-            stream_callback: Optional callback invoked with each text delta during streaming.
-                Used by the TTS pipeline to start audio generation before the full response.
-                When None (default), API calls use the standard non-streaming path.
-            persist_user_message: Optional clean user message to store in
-                transcripts/history when user_message contains API-only
-                synthetic prefixes.
-                    or queuing follow-up prefetch work.
+            user_message (str): 用户的消息或问题，这是对话的输入
+            system_message (str): 自定义系统消息（可选，如果提供则覆盖 ephemeral_system_prompt）
+            conversation_history (List[Dict]): 之前的对话消息历史（可选，用于继续会话）
+            task_id (str): 此任务的唯一标识符，用于隔离并发任务之间的虚拟机
+                          （可选，如果未提供则自动生成）
+            stream_callback: 可选的回调函数，在流式传输期间随每个文本增量调用。
+                           由 TTS 管道用于在完整响应之前开始音频生成。
+                           当为 None（默认）时，API 调用使用标准的非流式路径。
+            persist_user_message: 当 user_message 包含仅 API 的合成前缀时，
+                                要存储在转录/历史中的干净用户消息（可选）。
 
         Returns:
-            Dict: Complete conversation result with final response and message history
+            Dict: 包含最终响应和消息历史的完整对话结果
+                 - final_response: 最终的文本响应
+                 - messages: 完整的消息历史
+                 - api_calls: API 调用次数
+                 - completed: 是否成功完成
+                 - error: 错误信息（如果有）
         """
-        # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
-        # Installed once, transparent when streams are healthy, prevents crash on write.
+        # 防止管道破裂导致的 OSError（systemd/无头/守护进程模式）
+        # 只安装一次，当流健康时透明，防止写入时崩溃
         _install_safe_stdio()
 
-        # If the previous turn activated fallback, restore the primary
-        # runtime so this turn gets a fresh attempt with the preferred model.
-        # No-op when _fallback_activated is False (gateway, first turn, etc.).
+        # 如果上一轮激活了回退模型，恢复主运行时，
+        # 这样这一轮可以用首选模型重新尝试。
+        # 当 _fallback_activated 为 False 时为空操作（网关、第一轮等）。
         self._restore_primary_runtime()
 
-        # Sanitize surrogate characters from user input.  Clipboard paste from
-        # rich-text editors (Google Docs, Word, etc.) can inject lone surrogates
-        # that are invalid UTF-8 and crash JSON serialization in the OpenAI SDK.
+        # 清理用户输入中的代理字符。
+        # 从富文本编辑器（Google Docs、Word 等）粘贴的内容可能注入单独的代理字符，
+        # 这些在 UTF-8 中是无效的，会导致 OpenAI SDK 中的 JSON 序列化崩溃。
         if isinstance(user_message, str):
             user_message = _sanitize_surrogates(user_message)
         if isinstance(persist_user_message, str):
             persist_user_message = _sanitize_surrogates(persist_user_message)
 
-        # Store stream callback for _interruptible_api_call to pick up
+        # 存储流回调供 _interruptible_api_call 使用
         self._stream_callback = stream_callback
         self._persist_user_message_idx = None
         self._persist_user_message_override = persist_user_message
-        # Generate unique task_id if not provided to isolate VMs between concurrent tasks
+
+        # 如果未提供，生成唯一的 task_id 以隔离并发任务之间的虚拟机
         effective_task_id = task_id or str(uuid.uuid4())
-        
-        # Reset retry counters and iteration budget at the start of each turn
-        # so subagent usage from a previous turn doesn't eat into the next one.
+
+        # 在每轮开始时重置重试计数器和迭代预算，
+        # 这样上一轮的子智能体使用不会影响下一轮。
         self._invalid_tool_retries = 0
         self._invalid_json_retries = 0
         self._empty_content_retries = 0
@@ -7337,9 +7388,9 @@ class AIAgent:
         self._mute_post_response = False
         self._surrogate_sanitized = False
 
-        # Pre-turn connection health check: detect and clean up dead TCP
-        # connections left over from provider outages or dropped streams.
-        # This prevents the next API call from hanging on a zombie socket.
+        # 轮次前连接健康检查：检测并清理死 TCP 连接，
+        # 这些连接是从提供商中断或丢弃的流中遗留下来的。
+        # 这防止下一个 API 调用挂在僵尸套接字上。
         if self.api_mode != "anthropic_messages":
             try:
                 if self._cleanup_dead_connections():
@@ -7350,12 +7401,13 @@ class AIAgent:
                     )
             except Exception:
                 pass
-        # NOTE: _turns_since_memory and _iters_since_skill are NOT reset here.
-        # They are initialized in __init__ and must persist across run_conversation
-        # calls so that nudge logic accumulates correctly in CLI mode.
+
+        # 注意：_turns_since_memory 和 _iters_since_skill 在这里不重置。
+        # 它们在 __init__ 中初始化，必须在 run_conversation 调用之间持久化，
+        # 以便在 CLI 模式下正确累积提示逻辑。
         self.iteration_budget = IterationBudget(self.max_iterations)
 
-        # Log conversation turn start for debugging/observability
+        # 记录对话轮次开始，用于调试/可观察性
         _msg_preview = (user_message[:80] + "...") if len(user_message) > 80 else user_message
         _msg_preview = _msg_preview.replace("\n", " ")
         logger.info(
@@ -7365,37 +7417,34 @@ class AIAgent:
             _msg_preview,
         )
 
-        # Initialize conversation (copy to avoid mutating the caller's list)
+        # 初始化对话（复制以避免修改调用者的列表）
         messages = list(conversation_history) if conversation_history else []
 
-        # Strip budget pressure warnings from previous turns.  These are
-        # turn-scoped signals injected by _get_budget_warning() into tool
-        # result content.  If left in the replayed history, models (especially
-        # GPT-family) interpret them as still-active instructions and avoid
-        # making tool calls in ALL subsequent turns.
+        # 从之前的轮次中剥离预算压力警告。
+        # 这些是由 _get_budget_warning() 注入到工具结果内容中的轮次范围信号。
+        # 如果保留在重放的历史中，模型（特别是 GPT 系列）会将它们解释为仍然活跃的指令，
+        # 并避免在所有后续轮次中进行工具调用。
         if messages:
             _strip_budget_warnings_from_history(messages)
-        
-        # Hydrate todo store from conversation history (gateway creates a fresh
-        # AIAgent per message, so the in-memory store is empty -- we need to
-        # recover the todo state from the most recent todo tool response in history)
+
+        # 从对话历史中补充 todo 存储（网关为每条消息创建一个新的 AIAgent，
+        # 所以内存存储是空的 —— 我们需要从历史中最近的 todo 工具响应恢复 todo 状态）
         if conversation_history and not self._todo_store.has_items():
             self._hydrate_todo_store(conversation_history)
         
-        # Prefill messages (few-shot priming) are injected at API-call time only,
-        # never stored in the messages list. This keeps them ephemeral: they won't
-        # be saved to session DB, session logs, or batch trajectories, but they're
-        # automatically re-applied on every API call (including session continuations).
-        
-        # Track user turns for memory flush and periodic nudge logic
+        # 预填充消息（few-shot 引导）仅在 API 调用时注入，
+        # 从不存储在消息列表中。这使它们保持短暂：
+        # 它们不会保存到会话数据库、会话日志或批量轨迹，
+        # 但会在每次 API 调用时自动重新应用（包括会话继续）。
+
+        # 跟踪用户轮次用于记忆刷新和定期提示逻辑
         self._user_turn_count += 1
 
-        # Preserve the original user message (no nudge injection).
+        # 保留原始用户消息（无提示注入）。
         original_user_message = persist_user_message if persist_user_message is not None else user_message
 
-        # Track memory nudge trigger (turn-based, checked here).
-        # Skill trigger is checked AFTER the agent loop completes, based on
-        # how many tool iterations THIS turn used.
+        # 跟踪记忆提示触发器（基于轮次，在此检查）。
+        # 技能触发器在智能体循环完成后检查，基于此轮使用的工具迭代次数。
         _should_review_memory = False
         if (self._memory_nudge_interval > 0
                 and "memory" in self.valid_tool_names
@@ -7405,26 +7454,23 @@ class AIAgent:
                 _should_review_memory = True
                 self._turns_since_memory = 0
 
-        # Add user message
+        # 添加用户消息
         user_msg = {"role": "user", "content": user_message}
         messages.append(user_msg)
         current_turn_user_idx = len(messages) - 1
         self._persist_user_message_idx = current_turn_user_idx
-        
+
         if not self.quiet_mode:
             self._safe_print(f"💬 Starting conversation: '{user_message[:60]}{'...' if len(user_message) > 60 else ''}'")
         
-        # ── System prompt (cached per session for prefix caching) ──
-        # Built once on first call, reused for all subsequent calls.
-        # Only rebuilt after context compression events (which invalidate
-        # the cache and reload memory from disk).
+        # ── 系统提示词（每个会话缓存用于前缀缓存）──
+        # 在第一次调用时构建一次，在所有后续调用中重用。
+        # 仅在上下文压缩事件后重建（这会使缓存失效并从磁盘重新加载记忆）。
         #
-        # For continuing sessions (gateway creates a fresh AIAgent per
-        # message), we load the stored system prompt from the session DB
-        # instead of rebuilding.  Rebuilding would pick up memory changes
-        # from disk that the model already knows about (it wrote them!),
-        # producing a different system prompt and breaking the Anthropic
-        # prefix cache.
+        # 对于继续的会话（网关为每条消息创建一个新的 AIAgent），
+        # 我们从会话数据库加载存储的系统提示词而不是重建。
+        # 重建会从磁盘获取模型已经知道的记忆更改（它写入的！），
+        # 产生不同的系统提示词并破坏 Anthropic 前缀缓存。
         if self._cached_system_prompt is None:
             stored_prompt = None
             if conversation_history and self._session_db:
@@ -7433,19 +7479,19 @@ class AIAgent:
                     if session_row:
                         stored_prompt = session_row.get("system_prompt") or None
                 except Exception:
-                    pass  # Fall through to build fresh
+                    pass  # 回退到从头构建
 
             if stored_prompt:
-                # Continuing session — reuse the exact system prompt from
-                # the previous turn so the Anthropic cache prefix matches.
+                # 继续会话 —— 重用上一轮的确切系统提示词，
+                # 以便 Anthropic 缓存前缀匹配。
                 self._cached_system_prompt = stored_prompt
             else:
-                # First turn of a new session — build from scratch.
+                # 新会话的第一轮 —— 从头构建。
                 self._cached_system_prompt = self._build_system_prompt(system_message)
-                # Plugin hook: on_session_start
-                # Fired once when a brand-new session is created (not on
-                # continuation).  Plugins can use this to initialise
-                # session-scoped state (e.g. warm a memory cache).
+
+                # 插件钩子：on_session_start
+                # 在创建全新会话时触发一次（不在继续时）。
+                # 插件可以使用此钩子初始化会话范围的状态（例如预热记忆缓存）。
                 try:
                     from hermes_cli.plugins import invoke_hook as _invoke_hook
                     _invoke_hook(
@@ -7457,7 +7503,7 @@ class AIAgent:
                 except Exception as exc:
                     logger.warning("on_session_start hook failed: %s", exc)
 
-                # Store the system prompt snapshot in SQLite
+                # 在 SQLite 中存储系统提示词快照
                 if self._session_db:
                     try:
                         self._session_db.update_system_prompt(self.session_id, self._cached_system_prompt)
